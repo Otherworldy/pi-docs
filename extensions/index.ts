@@ -12,9 +12,9 @@ import {
   OUTPUT_MAX,
   existingDigestPath,
   formatSearch,
-  formatStatus,
   isOriginalTextFile,
   loadConfigFile,
+  configureKbInteractive,
   pathKey,
   searchKb,
   sha256,
@@ -42,12 +42,12 @@ function policy(config: LoadedConfig): string {
     return [
       "知识库插件已加载，但配置不可用。",
       `原因: ${config.error}`,
-      "不要宣称已查阅笔记；不要调用 kb_write。可用 /kb 查看状态。",
+      "不要宣称已查阅笔记；不要调用 kb_write。可用 /kb 查看或配置目录。",
     ].join("\n");
   }
   const names = config.roots.map((r) => `${r.name}${r.writable ? "(可写)" : "(只读)"}`).join("、");
   return [
-    "本地知识库工具: kb_search、kb_write。可用 /kb 查看来源。",
+    "本地知识库工具: kb_search、kb_write。可用 /kb 查看或配置来源。",
     `来源: ${names}`,
     "遇到内部业务规则、私有 API、历史约定或反复失败且资料可能相关时，先 kb_search。默认先看 AI 笔记；信息不足、有冲突或需要精确代码时，指定原始 root 或直接 read 来源。",
     "完整读过原始资料且结果里有 readRef 时，若当前不是讨论/规划/只读任务，用 kb_write(title, body, readRef) 保存该版本的资料整理。只转述已读文字，同版本已有整理则复用。",
@@ -169,11 +169,14 @@ export function createKbExtension(opts: KbOptions = {}) {
     });
 
     pi.registerCommand("kb", {
-      description: "Show knowledge-base roots and status",
+      description: "查看或配置知识库目录",
       handler: async (_args, ctx) => {
-        config = await loadConfigFile(opts.configPath ?? join(getAgentDir(), CONFIG_FILENAME), home);
-        const text = formatStatus(config);
-        if (ctx.hasUI) ctx.ui.notify(text);
+        const configPath = opts.configPath ?? join(getAgentDir(), CONFIG_FILENAME);
+        if (!ctx.hasUI) {
+          config = await loadConfigFile(configPath, home);
+          return;
+        }
+        config = await configureKbInteractive(configPath, ctx.ui, home);
       },
     });
 

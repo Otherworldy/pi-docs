@@ -13,8 +13,10 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   link,
   unlink,
+  writeFile,
 } from "node:fs/promises";
 import {
   basename,
@@ -952,6 +954,142 @@ export function formatStatus(config: LoadedConfig): string {
     lines.push(`- ${root.name} (${rw}) ${root.path} [${avail}]${ex}`);
   }
   return lines.join("\n");
+}
+
+export type RootChange =
+  | { op: "add"; name: string; path: string; writable?: boolean }
+  | { op: "remove"; name: string }
+  | { op: "setWritable"; name: string };
+
+export type KbUi = {
+  select(title: string, options: string[]): Promise<string | undefined>;
+  input(title: string, placeholder?: string): Promise<string | undefined>;
+  confirm(title: string, message: string): Promise<boolean>;
+  notify(text: string, level?: "info" | "warning" | "error"): void;
+};
+
+export function snapshotRoots(config: LoadedConfig): RootInput[] {
+  if (!config.ok) return [];
+  return config.roots.map((r) => ({
+    name: r.name,
+    path: r.configuredPath,
+    writable: r.writable,
+    exclude: [...r.exclude],
+  }));
+}
+
+export function applyRootChange(roots: RootInput[], change: RootChange): { ok: true; roots: RootInput[] } | Fail {
+  const next = roots.map((r) => ({ ...r, exclude: r.exclude ?? [] }));
+  if (change.op === "add") {
+    const name = change.name.trim();
+    const path = change.path.trim();
+    if (change.writable) {
+      for (const r of next) r.writable = false;
+    }
+    next.push({ name, path, writable: change.writable === true, exclude: [] });
+  } else if (change.op === "remove") {
+    const i = next.findIndex((r) => r.name === change.name);
+    if (i < 0) return { ok: false, error: `没有这个目录: ${change.name}` };
+    next.splice(i, 1);
+  } else {
+    const t = next.find((r) => r.name === change.name);
+    if (!t) return { ok: false, error: `没有这个目录: ${change.name}` };
+    for (const r of next) r.writable = r.name === change.name;
+  }
+  const parsed = parseConfigJson({ roots: next });
+  if (!parsed.ok) return parsed;
+  return { ok: true, roots: parsed.roots };
+}
+
+export async function saveConfigFile(
+  configPath: string,
+  roots: RootInput[],
+  home = homedir(),
+): Promise<LoadedConfig> {
+  const spec = parseConfigJson({ roots });
+  if (!spec.ok) return { ok: false, configPath, error: spec.error };
+  const body = `${JSON.stringify({
+    roots: spec.roots.map((r) => {
+      const o: { name: string; path: string; writable?: boolean; exclude?: string[] } = {
+        name: r.name,
+        path: r.path,
+      };
+      if (r.writable) o.writable = true;
+      if (r.exclude.length) o.exclude = r.exclude;
+      return o;
+    }),
+  }, null, 2)}\n`;
+  await mkdir(dirname(configPath), { recursive: true });
+  const tmpPath = join(dirname(configPath), `.pi-kb-${randomUUID()}.tmp`);
+  try {
+    await writeFile(tmpPath, body, { encoding: "utf8", flag: "wx" });
+    await rename(tmpPath, configPath);
+  } catch (err) {
+    try {
+      await unlink(tmpPath);
+    } catch {
+      /* ignore */
+    }
+    const code = (err as NodeJS.ErrnoException).code;
+    return { ok: false, configPath, error: `无法写入配置: ${code ?? "unknown"}` };
+  }
+  return loadConfigFile(configPath, home);
+}
+
+export async function configureKbInteractive(
+  configPath: string,
+  ui: KbUi,
+  home = homedir(),
+): Promise<LoadedConfig> {
+  let config = await loadConfigFile(configPath, home);
+  if (!config.ok && !config.error.includes("不存在")) {
+    const overwrite = await ui.confirm("覆盖损坏的配置？", config.error);
+    if (!overwrite) {
+      ui.notify(formatStatus(config), "error");
+      return config;
+    }
+  }
+  for (;;) {
+    const roots = snapshotRoots(config);
+    const options = ["完成", "添加目录"];
+    if (roots.length) options.push("删除目录", "设为记录目录");
+    const choice = await ui.select(formatStatus(config), options);
+    if (!choice || choice === "完成") {
+      ui.notify(formatStatus(config));
+      return config;
+    }
+    let change: RootChange | undefined;
+    if (choice === "添加目录") {
+      const name = (await ui.input("目录名称", roots.length ? "agent" : "obsidian"))?.trim();
+      if (!name) continue;
+      const path = (await ui.input("绝对路径或 ~/", "~/"))?.trim();
+      if (!path) continue;
+      let writable = false;
+      if (!roots.some((r) => r.writable)) {
+        writable = await ui.confirm("作为记录目录？", "kb_write 会写入此目录下的 digests/ 和 lessons/");
+      }
+      change = { op: "add", name, path, writable };
+    } else if (choice === "删除目录") {
+      const name = await ui.select("删除哪个目录？", roots.map((r) => r.name));
+      if (!name) continue;
+      if (!await ui.confirm("删除这个目录配置？", name)) continue;
+      change = { op: "remove", name };
+    } else if (choice === "设为记录目录") {
+      const name = await ui.select("哪个目录用于写入？", roots.map((r) => r.name));
+      if (!name) continue;
+      change = { op: "setWritable", name };
+    } else {
+      continue;
+    }
+    const applied = applyRootChange(roots, change);
+    if (!applied.ok) {
+      ui.notify(applied.error, "error");
+      continue;
+    }
+    const saved = await saveConfigFile(configPath, applied.roots, home);
+    config = saved;
+    ui.notify(saved.ok ? "已保存" : saved.error, saved.ok ? "info" : "error");
+  }
 }
 
 export function isOriginalTextFile(config: Extract<LoadedConfig, { ok: true }>, realPath: string): boolean {

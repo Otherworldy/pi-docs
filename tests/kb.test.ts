@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import {
+  applyRootChange,
+  configureKbInteractive,
   decodeEntities,
   digestFileName,
   excluded,
@@ -12,6 +14,7 @@ import {
   parseConfigJson,
   pathInside,
   pathKey,
+  saveConfigFile,
   searchKb,
   sha256,
   writeDigest,
@@ -94,6 +97,51 @@ describe("config", () => {
       digestFileName("C:\\Notes\\A.md", "abc", "win32"),
       digestFileName("c:/notes/a.md", "abc", "win32"),
     );
+  });
+
+  it("applyRootChange add/remove/setWritable", () => {
+    const added = applyRootChange([], { op: "add", name: "notes", path: "/vault", writable: true });
+    assert.equal(added.ok, true);
+    if (!added.ok) return;
+    const second = applyRootChange(added.roots, { op: "add", name: "agent", path: "/vault/agent", writable: true });
+    assert.equal(second.ok, true);
+    if (!second.ok) return;
+    assert.equal(second.roots.filter((r) => r.writable).length, 1);
+    assert.equal(second.roots.find((r) => r.name === "agent")?.writable, true);
+    const removed = applyRootChange(second.roots, { op: "remove", name: "notes" });
+    assert.equal(removed.ok, true);
+    if (!removed.ok) return;
+    assert.equal(removed.roots.length, 1);
+    const rel = applyRootChange([], { op: "add", name: "x", path: "rel" });
+    assert.equal(rel.ok, false);
+  });
+
+  it("saveConfigFile round-trips and interactive add creates config", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await mkdir(notes);
+    const configPath = join(dir, "pi-kb.json");
+    const saved = await saveConfigFile(configPath, [{ name: "notes", path: notes, writable: true }]);
+    assert.equal(saved.ok, true);
+    if (!saved.ok) return;
+    assert.equal(saved.writable?.name, "notes");
+
+    const other = join(dir, "other");
+    await mkdir(other);
+    const selects = ["添加目录", "完成"];
+    const inputs = ["docs", other];
+    const ui = {
+      select: async () => selects.shift(),
+      input: async () => inputs.shift(),
+      confirm: async () => false,
+      notify() {},
+    };
+    const loaded = await configureKbInteractive(configPath, ui);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    assert.equal(loaded.roots.length, 2);
+    assert.equal(loaded.roots.some((r) => r.name === "docs"), true);
+    assert.equal(loaded.writable?.name, "notes");
   });
 
   it("exclude matches path segments, not prefixes", () => {
