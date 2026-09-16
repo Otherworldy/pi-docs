@@ -53,7 +53,7 @@ Windows：路径比较忽略大小写和斜杠方向；目录联接按符号链�
 
 ## 测试
 
-需要能解析 `peerDependencies`（本机已安装 Pi 即可）：
+逻辑测试不依赖 `node_modules`。Pi 加载插件时会注入 `pi-coding-agent` / `typebox`，使用时不必 `npm install`。
 
 ```bash
 npm test
