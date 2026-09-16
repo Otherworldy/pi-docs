@@ -10,6 +10,8 @@ import {
   digestFileName,
   excluded,
   findSecretKind,
+  isTruncatedReadResult,
+  normalizeReadRef,
   loadConfigFile,
   parseConfigJson,
   pathInside,
@@ -149,6 +151,25 @@ describe("config", () => {
     assert.equal(excluded("日志\\x.md", ["日志"]), true);
     assert.equal(excluded("done/todo 1.md", ["done/todo 1.md"]), true);
     assert.equal(excluded("done-extra/x.md", ["done"]), false);
+  });
+});
+
+describe("readRef helpers", () => {
+  it("limit alone is not truncated; offset/footer/details are", () => {
+    assert.equal(isTruncatedReadResult({}, "hello"), false);
+    assert.equal(isTruncatedReadResult({}, "hello", 1), false);
+    assert.equal(isTruncatedReadResult({}, "hello", 2), true);
+    assert.equal(isTruncatedReadResult({ truncation: { truncated: true } }, "hello"), true);
+    assert.equal(isTruncatedReadResult({}, "x\n\n[3 more lines in file. Use offset=4 to continue.]"), true);
+    assert.equal(isTruncatedReadResult({}, "[Showing lines 1-20 of 40. Use offset=21 to continue.]"), true);
+  });
+
+  it("normalizeReadRef accepts UUID, readRef= prefix, quotes, and paths", () => {
+    const id = "2b8220e0-1234-4567-89ab-cdef01234567";
+    assert.equal(normalizeReadRef(`readRef=${id}`), id);
+    assert.equal(normalizeReadRef(`  ${id}  `), id);
+    assert.equal(normalizeReadRef(`"${id}"`), id);
+    assert.equal(normalizeReadRef("/home/Node/pi-docs/Obsidian/a.md"), "/home/Node/pi-docs/Obsidian/a.md");
   });
 });
 

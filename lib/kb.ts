@@ -138,6 +138,22 @@ export function sha256(data: string | Buffer): string {
   return createHash("sha256").update(data).digest("hex");
 }
 
+export function isTruncatedReadResult(details: unknown, text: string, offset?: number): boolean {
+  const tr = details && typeof details === "object"
+    ? (details as { truncation?: { truncated?: boolean } }).truncation
+    : undefined;
+  if (tr?.truncated) return true;
+  if (offset !== undefined && offset > 1) return true;
+  return /\[Showing lines |more lines in file\. Use offset=/.test(text);
+}
+
+export function normalizeReadRef(raw: string): string {
+  const trimmed = raw.trim();
+  const uuid = /(?:readRef\s*=\s*)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(trimmed);
+  if (uuid) return uuid[1].toLowerCase();
+  return trimmed.replace(/^["'`]+|["'`]+$/g, "").trim();
+}
+
 export function expandUserPath(p: string, home = homedir()): string {
   if (p === "~") return home;
   if (p.startsWith("~/")) return join(home, p.slice(2));

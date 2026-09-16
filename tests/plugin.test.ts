@@ -98,6 +98,20 @@ describe("pi extension", () => {
     assert.match(full.content.at(-1).text, /readRef=/);
     const readRef = /readRef=([0-9a-f-]+)/.exec(full.content.at(-1).text)![1];
 
+    const wrapped = await tools.kb_write.execute("w-wrap", {
+      title: "selectCompare",
+      body: "默认 headerField 是 person。",
+      readRef: `readRef=${readRef}`,
+    }, undefined, undefined, ctx);
+    assert.match(wrapped.content[0].text, /digest/);
+
+    const byPath = await tools.kb_write.execute("w-path", {
+      title: "selectCompare",
+      body: "默认 headerField 是 person。",
+      readRef: src,
+    }, undefined, undefined, ctx);
+    assert.match(byPath.content[0].text, /digest/);
+
     const truncId = "call-2";
     await handlers.tool_call({ toolName: "read", toolCallId: truncId, input: { path: src, limit: 1 } }, ctx);
     const trunc = await handlers.tool_result({
@@ -146,6 +160,28 @@ describe("pi extension", () => {
       readRef,
     }, undefined, undefined, ctx);
     assert.equal(afterReload.isError, true);
+  });
+
+  it("complete read with limit and extra wrapper still issues readRef", async () => {
+    const { tools, handlers, src, body, ctx } = await setup();
+    const id = "call-limit";
+    await handlers.tool_call({ toolName: "read", toolCallId: id, input: { path: src, limit: 50 } }, ctx);
+    const full = await handlers.tool_result({
+      toolName: "read",
+      toolCallId: id,
+      isError: false,
+      content: [{ type: "text", text: `not-the-file-bytes\n${body}` }],
+      details: {},
+    }, ctx);
+    assert.match(full.content.at(-1).text, /readRef=/);
+    const readRef = /readRef=([0-9a-f-]+)/.exec(full.content.at(-1).text)![1];
+    const written = await tools.kb_write.execute("w", {
+      title: "ok",
+      body: "headerField 默认是 person。",
+      readRef,
+    }, undefined, undefined, ctx);
+    assert.equal(written.isError, undefined);
+    assert.match(written.content[0].text, /digest/);
   });
 
   it("hash mismatch after read does not issue readRef", async () => {
