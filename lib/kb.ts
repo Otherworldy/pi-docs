@@ -739,6 +739,11 @@ async function validateDigest(
   return { usable: true, meta, sourceStatus: "unchanged" };
 }
 
+function isAiNoteRel(relPath: string): boolean {
+  const rel = relPath.replaceAll("\\", "/");
+  return rel === "digests" || rel === "lessons" || rel.startsWith("digests/") || rel.startsWith("lessons/");
+}
+
 async function searchLayer(
   config: Extract<LoadedConfig, { ok: true }>,
   roots: LoadedRoot[],
@@ -752,6 +757,7 @@ async function searchLayer(
   for (const root of roots) {
     if (!root.exists || !root.realPath) continue;
     await walkFiles(root, skipInside, b, async (realPath, relPath) => {
+      if (kindHint === "ai" && !isAiNoteRel(relPath)) return;
       const seenKey = pathKey(realPath);
       if (seen.has(seenKey)) return;
       if (coveredAndExcluded(realPath, roots)) {
@@ -910,22 +916,12 @@ export async function searchKb(
       }
       return { ok: false, error: `root 目录不存在: ${root.name} (${root.path})` };
     }
-    if (root.writable) {
-      const hits = await searchLayer(config, [root], [], terms, "ai", b);
-      return {
-        ok: true,
-        hits: hits.slice(0, limit),
-        originalsSearched: false,
-        truncated: b.truncated,
-        skipped: b.skipped,
-        skipReasons: b.reasons,
-      };
-    }
+    const aiHits = root.writable ? await searchLayer(config, [root], [], terms, "ai", b) : [];
     const prepared = await prepareReadonlyRoot(config, root, { signal: opts.signal });
     if (!prepared.ok) return prepared;
     mergeSkip(b, prepared.snapshot);
-    const records = await loadSemanticIndex(prepared.snapshot.sourcePath);
-    const hits = hitsFromPrepared(prepared.snapshot, terms, root.name, records);
+    const origHits = hitsFromPrepared(prepared.snapshot, terms, root.name, await loadSemanticIndex(prepared.snapshot.sourcePath));
+    const hits = [...aiHits, ...origHits].sort((a, b) => b.pathScore - a.pathScore || a.path.localeCompare(b.path));
     return {
       ok: true,
       hits: hits.slice(0, limit),
@@ -952,13 +948,13 @@ export async function searchKb(
       skipReasons: b.reasons,
     };
   }
-  const originalRoots = config.roots.filter((r) => !r.writable);
-  const missing = originalRoots.filter((r) => !r.exists);
-  if (missing.length && originalRoots.every((r) => !r.exists)) {
+  const readonlyRoots = config.roots.filter((r) => !r.writable);
+  const missing = readonlyRoots.filter((r) => !r.exists);
+  if (missing.length && readonlyRoots.every((r) => !r.exists)) {
     return { ok: false, error: `只读 root 不存在: ${missing.map((r) => r.name).join(", ")}` };
   }
   const origHits: SearchHit[] = [];
-  for (const root of originalRoots.filter((r) => r.exists)) {
+  for (const root of config.roots.filter((r) => r.exists)) {
     const prepared = await prepareReadonlyRoot(config, root, { signal: opts.signal });
     if (!prepared.ok) return prepared;
     mergeSkip(b, prepared.snapshot);
@@ -1290,7 +1286,7 @@ async function afterAddReadonly(
   home: string,
 ): Promise<LoadedConfig> {
   const root = config.roots.find((r) => r.name === name);
-  if (!root || root.writable) return config;
+  if (!root) return config;
   if (!root.exists) {
     ui.notify(`目录已保存，但路径不存在: ${root.path}`, "warning");
     return config;
@@ -1338,8 +1334,7 @@ export async function configureKbInteractive(
   for (;;) {
     const roots = snapshotRoots(config);
     const options = ["完成", "添加目录"];
-    if (roots.length) options.push("删除目录", "设为记录目录", "刷新资料");
-    if (roots.some((r) => !r.writable)) options.push("AI 整理", "暂停 AI");
+    if (roots.length) options.push("删除目录", "设为记录目录", "刷新资料", "AI 整理", "暂停 AI");
     const choice = await ui.select(formatStatus(config), options);
     if (!choice || choice === "完成") {
       ui.notify(formatStatus(config));
@@ -1347,9 +1342,9 @@ export async function configureKbInteractive(
     }
     if (choice === "刷新资料" || choice === "AI 整理" || choice === "暂停 AI") {
       if (!config.ok) continue;
-      const readonlyNames = config.roots.filter((r) => !r.writable).map((r) => r.name);
+      const names = config.roots.map((r) => r.name);
       if (choice === "刷新资料") {
-        const name = await ui.select("刷新哪个目录？", readonlyNames);
+        const name = await ui.select("刷新哪个目录？", names);
         if (!name) continue;
         const root = config.roots.find((r) => r.name === name);
         if (!root) continue;
@@ -1362,7 +1357,7 @@ export async function configureKbInteractive(
           ui.notify("当前环境不能调用清洗模型", "error");
           continue;
         }
-        const name = await ui.select("整理哪个目录？", readonlyNames);
+        const name = await ui.select("整理哪个目录？", names);
         if (!name) continue;
         const model = await hooks.resolveModel(config.enrich);
         if (!model) continue;
@@ -1379,7 +1374,7 @@ export async function configureKbInteractive(
         ui.notify(await hooks.start(savedModel, name));
         continue;
       }
-      const name = await ui.select("暂停哪个目录？", readonlyNames);
+      const name = await ui.select("暂停哪个目录？", names);
       if (!name) continue;
       ui.notify(hooks?.pause ? await hooks.pause(name) : "没有进行中的任务");
       continue;
@@ -1415,7 +1410,7 @@ export async function configureKbInteractive(
     const saved = await saveConfigFile(configPath, applied.roots, home);
     config = saved;
     ui.notify(saved.ok ? "已保存" : saved.error, saved.ok ? "info" : "error");
-    if (saved.ok && change.op === "add" && !change.writable) {
+    if (saved.ok && change.op === "add") {
       config = await afterAddReadonly(saved, change.name, ui, hooks, configPath, home);
     }
   }
@@ -1706,20 +1701,29 @@ function snapshotFingerprint(snapshot: Pick<PreparedSnapshot, "sourceKey" | "exc
   }));
 }
 
+function skipInsideForPrepare(config: Extract<LoadedConfig, { ok: true }>, root: LoadedRoot): string[] {
+  const skip: string[] = [];
+  if (root.realPath) skip.push(cacheDirFor(root.realPath));
+  const w = config.writable?.realPath;
+  if (!w) return skip;
+  if (root.writable || (root.realPath && samePath(root.realPath, w))) {
+    skip.push(join(w, "digests"), join(w, "lessons"));
+  } else {
+    skip.push(w);
+  }
+  return skip;
+}
+
 export async function prepareReadonlyRoot(
   config: LoadedConfig,
   root: LoadedRoot,
   opts: { signal?: AbortSignal; now?: Date } = {},
 ): Promise<PrepareOk | Fail> {
   if (!config.ok) return { ok: false, error: config.error };
-  if (root.writable) return { ok: false, error: "记录目录不生成来源清洗资料" };
   if (!root.exists || !root.realPath) return { ok: false, error: `root 目录不存在: ${root.name} (${root.path})` };
 
   const b = newBudget(opts.signal);
-  const skipInside: string[] = [];
-  if (config.writable?.realPath) skipInside.push(config.writable.realPath);
-  const cacheDir = cacheDirFor(root.realPath);
-  skipInside.push(cacheDir);
+  const skipInside = skipInsideForPrepare(config, root);
   await migrateLegacyCache(config.configPath, root.realPath);
 
   const files: ScannedFile[] = [];

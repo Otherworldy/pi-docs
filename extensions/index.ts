@@ -161,7 +161,7 @@ export function createKbExtension(opts: KbOptions = {}) {
     pi.on("session_start", async () => {
       await reload();
       if (!config.ok) return;
-      for (const root of config.roots.filter((r) => !r.writable && r.exists)) {
+      for (const root of config.roots.filter((r) => r.exists)) {
         await prepareReadonlyRoot(config, root);
       }
     });
@@ -257,7 +257,7 @@ export function createKbExtension(opts: KbOptions = {}) {
           if (!config.ok) return;
           const [cmd, name] = args.split(/\s+/, 2);
           if (!cmd || cmd === "refresh") {
-            for (const root of config.roots.filter((r) => !r.writable && (!name || r.name === name))) {
+            for (const root of config.roots.filter((r) => r.exists && (!name || r.name === name))) {
               await prepareReadonlyRoot(config, root);
             }
             return;

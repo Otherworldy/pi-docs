@@ -203,6 +203,47 @@ describe("config", () => {
     assert.equal(r.hits.length, 1);
   });
 
+  it("record dir is prepared and listed for AI", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await mkdir(notes);
+    await write(join(notes, "a.md"), "vault-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    const confirms = [true, false];
+    let menu: string[] | undefined;
+    const selects = ["添加目录", "完成"];
+    const inputs = ["notes", notes];
+    const ui = {
+      select: async (_title: string, options?: string[]) => {
+        if (!menu && options?.includes("添加目录")) menu = options;
+        return selects.shift();
+      },
+      input: async () => inputs.shift(),
+      confirm: async () => confirms.shift() ?? false,
+      notify() {},
+    };
+    const loaded = await configureKbInteractive(configPath, ui);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    assert.equal(loaded.writable?.name, "notes");
+    const r = await searchKb(loaded, "vault-token");
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(r.hits.length, 1);
+    assert.equal(r.hits[0].kind, "original");
+    const again = await configureKbInteractive(configPath, {
+      select: async (_title: string, options?: string[]) => {
+        menu = options;
+        return "完成";
+      },
+      input: async () => undefined,
+      confirm: async () => false,
+      notify() {},
+    });
+    assert.equal(again.ok, true);
+    assert.ok(menu?.includes("AI 整理"));
+  });
+
   it("exclude matches path segments, not prefixes", () => {
     assert.equal(excluded("日志/x.md", ["日志"]), true);
     assert.equal(excluded("日志\\x.md", ["日志"]), true);
@@ -616,5 +657,29 @@ describe("prepare", () => {
     assert.equal(truncated.status, "memory_only");
     assert.equal(truncated.snapshot.truncated, true);
     assert.equal(await readFile(first.path, "utf8"), before);
+  });
+
+  it("prepares writable vault notes and skips digests/lessons", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await write(join(notes, "插件/Search.md"), "# 搜索栏\n条件是与关系\n");
+    await write(join(notes, "digests/keep.md"), "digest-only-token\n");
+    await write(join(notes, "lessons/keep.md"), "lesson-only-token\n");
+    const loaded = await cfg(dir, [{ name: "notes", path: notes, writable: true }]);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const prepared = await prepareReadonlyRoot(loaded, loaded.roots[0]);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    assert.equal(prepared.snapshot.docs.length, 1);
+    assert.equal(prepared.snapshot.docs[0].title, "搜索栏");
+    const titled = await searchKb(loaded, "搜索栏", { root: "notes" });
+    assert.equal(titled.ok, true);
+    if (!titled.ok) return;
+    assert.ok(titled.hits.some((h) => h.kind === "original" && h.title === "搜索栏"));
+    const digest = await searchKb(loaded, "digest-only-token", { root: "notes" });
+    assert.equal(digest.ok, true);
+    if (!digest.ok) return;
+    assert.ok(digest.hits.some((h) => h.kind === "lesson" && h.path.includes("digests")));
   });
 });

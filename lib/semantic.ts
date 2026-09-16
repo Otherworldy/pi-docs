@@ -400,7 +400,7 @@ export async function startEnrichment(
 ): Promise<string> {
   if (!config.enrich) return "未配置清洗模型";
   const root = config.roots.find((r) => r.name === rootName);
-  if (!root || root.writable) return "只能整理只读来源";
+  if (!root) return "未知来源";
   const prepared = await prepareReadonlyRoot(config, root, { signal: opts.signal });
   if (!prepared.ok) return prepared.error;
   const sourcePath = prepared.snapshot.sourcePath;

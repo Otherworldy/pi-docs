@@ -170,4 +170,42 @@ describe("semantic", () => {
     const paused = await startEnrichment(loaded, "notes", async () => ({ text: "x", inputTokens: 1, outputTokens: 1, costUnknown: true }), { maxRequests: 0 });
     assert.match(paused, /部分完成|请求/);
   });
+
+  it("enriches a writable vault", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-kb-semw-"));
+    const notes = join(dir, "notes");
+    await write(join(notes, "bar.md"), "搜索栏的所有条件之间是与关系，不支持或的关系\n");
+    await write(join(notes, "digests/x.md"), "digest-only\n");
+    const configPath = join(dir, "pi-kb.json");
+    await writeFile(configPath, JSON.stringify({
+      roots: [{ name: "notes", path: notes, writable: true }],
+      enrich,
+    }));
+    const loaded = await loadConfigFile(configPath);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    let calls = 0;
+    const complete: ModelComplete = async () => {
+      calls += 1;
+      return {
+        text: JSON.stringify({
+          summary: "AND",
+          topics: ["Searchbar"],
+          aliases: [],
+          questions: ["几个条件满足一个是否可以"],
+          rules: [{ text: "AND", startLine: 1, endLine: 1, excerpt: "不支持或的关系" }],
+        }),
+        inputTokens: 1,
+        outputTokens: 1,
+      };
+    };
+    const status = await startEnrichment(loaded, "notes", complete);
+    assert.match(status, /全量完成|1\/1/);
+    assert.equal(calls, 1);
+    const hit = await searchKb(loaded, "几个条件 满足一个", { root: "notes" });
+    assert.equal(hit.ok, true);
+    if (!hit.ok) return;
+    assert.equal(hit.hits.length, 1);
+    assert.equal(hit.hits[0].kind, "original");
+  });
 });
