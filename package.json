@@ -1,0 +1,33 @@
+{
+  "name": "pi-kb",
+  "version": "0.1.0",
+  "description": "Pi extension: search local notes/docs and write agent digests/lessons.",
+  "type": "module",
+  "files": [
+    "extensions/**/*.ts",
+    "lib/**/*.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "notes",
+    "knowledge"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  }
+}
