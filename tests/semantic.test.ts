@@ -100,9 +100,12 @@ describe("semantic", () => {
         outputTokens: 8,
       };
     };
-    const status = await startEnrichment(loaded, "notes", complete);
+    const seen: string[] = [];
+    const status = await startEnrichment(loaded, "notes", complete, { onProgress: (text) => seen.push(text) });
     assert.match(status, /全量完成|1\/1/);
     assert.equal(calls, 1);
+    assert.ok(seen.some((s) => s.includes("进行中") && s.includes("正在:")));
+    assert.ok(seen.some((s) => s.includes("全量完成") && s.includes("(100%)")));
     const hit = await searchKb(loaded, "几个条件 满足一个", { root: "notes" });
     assert.equal(hit.ok, true);
     if (!hit.ok) return;

@@ -375,13 +375,21 @@ function reuseChunks(prev: EnrichJob | undefined, next: EnrichJob): EnrichJob {
   };
 }
 
-export function jobSummary(job: EnrichJob): string {
+export function jobSummary(job: EnrichJob, current?: string): string {
   const total = job.chunks.length;
   const done = job.chunks.filter((c) => c.status === "completed").length;
   const failed = job.chunks.filter((c) => c.status === "failed").length;
   const pending = job.chunks.filter((c) => c.status === "pending" || c.status === "running").length;
-  const complete = pending === 0 && failed === 0 && job.chunks.every((c) => c.status === "completed");
-  return `${job.rootName}: ${complete ? "全量完成" : "部分完成"} ${done}/${total} 块，失败 ${failed}，请求 ${job.requests}/${job.maxRequests}，tokens ${job.inputTokens}+${job.outputTokens}`;
+  const pct = total ? Math.round((100 * done) / total) : 0;
+  const state = job.paused && pending > 0
+    ? "已暂停"
+    : pending === 0 && failed === 0
+      ? "全量完成"
+      : pending === 0
+        ? "部分完成"
+        : "进行中";
+  const now = current?.trim() ? ` 正在:${current.trim().slice(0, 32)}` : "";
+  return `${job.rootName}: ${state} ${done}/${total} (${pct}%)，失败 ${failed}，请求 ${job.requests}/${job.maxRequests}${now}`;
 }
 
 export async function pauseJob(sourcePath: string): Promise<string> {
@@ -396,7 +404,7 @@ export async function startEnrichment(
   config: Extract<LoadedConfig, { ok: true }>,
   rootName: string,
   complete: ModelComplete,
-  opts: { signal?: AbortSignal; maxRequests?: number } = {},
+  opts: { signal?: AbortSignal; maxRequests?: number; onProgress?: (text: string) => void } = {},
 ): Promise<string> {
   if (!config.enrich) return "未配置清洗模型";
   const root = config.roots.find((r) => r.name === rootName);
@@ -411,7 +419,9 @@ export async function startEnrichment(
     let job = reuseChunks(await loadJob(sourcePath), buildJob(prepared.snapshot, config.enrich, opts.maxRequests));
     job.paused = false;
     const docs = new Map(prepared.snapshot.docs.map((d) => [pathKey(d.path), d]));
+    const progress = (title?: string) => opts.onProgress?.(jobSummary(job, title));
     await saveJob(sourcePath, job);
+    progress();
     for (const chunk of job.chunks) {
       if (job.paused || opts.signal?.aborted) break;
       if (chunk.status === "completed") continue;
@@ -426,6 +436,7 @@ export async function startEnrichment(
       }
       chunk.status = "running";
       job.requests += 1;
+      progress(doc.title);
       const body = doc.lines.slice(chunk.startLine - 1, chunk.endLine).map((line, i) => `${chunk.startLine + i}|${line}`).join("\n");
       const user = `标题: ${doc.title}\n分类: ${doc.catalog.join(" / ")}\n行 ${chunk.startLine}-${chunk.endLine}:\n${body}`;
       try {
@@ -479,12 +490,15 @@ export async function startEnrichment(
         break;
       }
       await saveJob(sourcePath, job);
+      progress();
     }
 
     job.records = materializeRecords(job, docs, config.enrich);
     await saveSemantics(sourcePath, sourceKey, job.records);
     await saveJob(sourcePath, job);
-    return jobSummary(job);
+    const summary = jobSummary(job);
+    opts.onProgress?.(summary);
+    return summary;
   } finally {
     await releaseLock(sourcePath, lock.token);
   }

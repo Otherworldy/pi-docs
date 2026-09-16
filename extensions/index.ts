@@ -122,7 +122,12 @@ function enrichHooksFor(ctx: any, configPath: string, home: string): EnrichHooks
     },
     async start(loaded, rootName) {
       if (!loaded.enrich) return "未配置清洗模型";
-      return startEnrichment(loaded, rootName, makeComplete(ctx, loaded.enrich));
+      return startEnrichment(loaded, rootName, makeComplete(ctx, loaded.enrich), {
+        onProgress(text) {
+          ctx.ui?.setStatus?.("pi-kb", text);
+          ctx.ui?.notify?.(text);
+        },
+      });
     },
     async pause(rootName) {
       const loaded = await loadConfigFile(configPath, home);

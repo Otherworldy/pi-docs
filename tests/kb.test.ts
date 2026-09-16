@@ -7,6 +7,7 @@ import {
   applyRootChange,
   configureKbInteractive,
   decodeEntities,
+  formatStatus,
   digestFileName,
   excluded,
   findSecretKind,
@@ -242,6 +243,37 @@ describe("config", () => {
     });
     assert.equal(again.ok, true);
     assert.ok(menu?.includes("AI 整理"));
+  });
+
+  it("formatStatus shows paused job progress", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await mkdir(join(notes, ".pi-kb"), { recursive: true });
+    await writeFile(join(notes, ".pi-kb/job.json"), JSON.stringify({
+      version: 1,
+      rootName: "notes",
+      sourceKey: "x",
+      provider: "test",
+      model: "fake",
+      promptVersion: 1,
+      chunkVersion: 1,
+      maxRequests: 10,
+      requests: 4,
+      inputTokens: 1,
+      outputTokens: 1,
+      costUnknown: false,
+      paused: true,
+      chunks: [
+        { docPath: join(notes, "a.md"), sourceHash: "h", index: 0, startLine: 1, endLine: 1, status: "completed" },
+        { docPath: join(notes, "b.md"), sourceHash: "h", index: 0, startLine: 1, endLine: 1, status: "pending" },
+      ],
+      records: [],
+    }));
+    const loaded = await cfg(dir, [{ name: "notes", path: notes }]);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const text = await formatStatus(loaded);
+    assert.match(text, /已暂停 1\/2 \(50%\)/);
   });
 
   it("exclude matches path segments, not prefixes", () => {

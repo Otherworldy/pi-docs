@@ -1161,7 +1161,7 @@ export function sourceTitleFrom(path: string, text: string): string {
   return basename(path, extname(path));
 }
 
-export function formatStatus(config: LoadedConfig): string {
+export async function formatStatus(config: LoadedConfig): Promise<string> {
   const lines = [`配置: ${config.configPath}`];
   if (!config.ok) {
     lines.push(`状态: 不可用 — ${config.error}`);
@@ -1172,13 +1172,27 @@ export function formatStatus(config: LoadedConfig): string {
   lines.push(`格式: ${[...TEXT_EXTS].join(" ")}`);
   if (config.enrich) lines.push(`清洗模型: ${config.enrich.provider}/${config.enrich.model}`);
   else lines.push("清洗模型: 未配置（导入时可选择）");
+  const jobs = await loadJobSummaries(config);
   for (const root of config.roots) {
     const rw = root.writable ? "可写" : "只读";
     const ex = root.exclude.length ? ` exclude=${root.exclude.join("|")}` : "";
     let avail = root.exists ? root.realPath ?? root.path : root.writable ? "首次记录时创建" : "缺失";
     lines.push(`- ${root.name} (${rw}) ${root.path} [${avail}]${ex}`);
+    const job = jobs.get(root.name);
+    if (job) lines.push(`  ${job}`);
   }
   return lines.join("\n");
+}
+
+async function loadJobSummaries(config: Extract<LoadedConfig, { ok: true }>): Promise<Map<string, string>> {
+  const { loadJob, jobSummary } = await import("./semantic.ts");
+  const out = new Map<string, string>();
+  for (const root of config.roots) {
+    if (!root.realPath) continue;
+    const job = await loadJob(root.realPath);
+    if (job) out.set(root.name, jobSummary(job));
+  }
+  return out;
 }
 
 export type RootChange =
@@ -1327,7 +1341,7 @@ export async function configureKbInteractive(
   if (!config.ok && !config.error.includes("不存在")) {
     const overwrite = await ui.confirm("覆盖损坏的配置？", config.error);
     if (!overwrite) {
-      ui.notify(formatStatus(config), "error");
+      ui.notify(await formatStatus(config), "error");
       return config;
     }
   }
@@ -1335,9 +1349,9 @@ export async function configureKbInteractive(
     const roots = snapshotRoots(config);
     const options = ["完成", "添加目录"];
     if (roots.length) options.push("删除目录", "设为记录目录", "刷新资料", "AI 整理", "暂停 AI");
-    const choice = await ui.select(formatStatus(config), options);
+    const choice = await ui.select(await formatStatus(config), options);
     if (!choice || choice === "完成") {
-      ui.notify(formatStatus(config));
+      ui.notify(await formatStatus(config));
       return config;
     }
     if (choice === "刷新资料" || choice === "AI 整理" || choice === "暂停 AI") {
