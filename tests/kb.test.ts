@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
@@ -13,12 +13,16 @@ import {
   isTruncatedReadResult,
   normalizeReadRef,
   loadConfigFile,
+  extractNoteTitle,
   parseConfigJson,
+  parseShowDocReadme,
   pathInside,
   pathKey,
+  prepareReadonlyRoot,
   saveConfigFile,
   searchKb,
   sha256,
+  sourceCachePath,
   writeDigest,
   writeLesson,
   type LoadedConfig,
@@ -118,6 +122,26 @@ describe("config", () => {
     assert.equal(rel.ok, false);
   });
 
+  it("enrich settings round-trip and survive root edits", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await mkdir(notes);
+    const configPath = join(dir, "pi-kb.json");
+    const enrich = { provider: "openai", model: "gpt-4.1-mini", maxOutputTokens: 2048, timeoutMs: 60000 };
+    const saved = await saveConfigFile(configPath, [{ name: "notes", path: notes }], undefined, enrich);
+    assert.equal(saved.ok, true);
+    if (!saved.ok) return;
+    assert.equal(saved.enrich?.model, "gpt-4.1-mini");
+    const added = await saveConfigFile(configPath, [
+      { name: "notes", path: notes },
+      { name: "docs", path: join(dir, "docs") },
+    ]);
+    assert.equal(added.ok, true);
+    if (!added.ok) return;
+    assert.equal(added.enrich?.provider, "openai");
+    assert.equal(parseConfigJson({ roots: [{ name: "n", path: "/x" }] }).ok, true);
+  });
+
   it("saveConfigFile round-trips and interactive add creates config", async () => {
     const dir = await tmp();
     const notes = join(dir, "notes");
@@ -144,6 +168,39 @@ describe("config", () => {
     assert.equal(loaded.roots.length, 2);
     assert.equal(loaded.roots.some((r) => r.name === "docs"), true);
     assert.equal(loaded.writable?.name, "notes");
+  });
+
+  it("interactive add prepares source and does not start AI when declined", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await mkdir(notes);
+    await write(join(notes, "a.md"), "hello-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    let started = 0;
+    const selects = ["添加目录", "完成"];
+    const inputs = ["notes", notes];
+    const ui = {
+      select: async () => selects.shift(),
+      input: async () => inputs.shift(),
+      confirm: async () => false,
+      notify() {},
+    };
+    const loaded = await configureKbInteractive(configPath, ui, undefined, {
+      resolveModel: async () => {
+        throw new Error("rule mode must not pick a model");
+      },
+      start: async () => {
+        started += 1;
+        return "started";
+      },
+    });
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    assert.equal(started, 0);
+    const r = await searchKb(loaded, "hello-token");
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(r.hits.length, 1);
   });
 
   it("exclude matches path segments, not prefixes", () => {
@@ -405,5 +462,159 @@ describe("ai-first search and write", () => {
     assert.equal(w.ok, false);
     if (w.ok) return;
     assert.doesNotMatch(w.error, /sk-abcdefghijklmnopqrstuvwxyz123456/);
+  });
+});
+
+describe("prepare", () => {
+  it("extracts markdown title outside fences and maps ShowDoc readme", () => {
+    assert.equal(extractNoteTitle("```\n# fake\n```\n# 真实标题\n"), "真实标题");
+    const mapped = parseShowDocReadme("搜索栏Searchbar —— prefix_aaa.md\n");
+    assert.equal(mapped.get("prefix_aaa.md"), "搜索栏Searchbar");
+  });
+
+  it("prepares ordinary notes without a writable root and does not change sources", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    const src = join(notes, "插件/Search.md");
+    const body = "# 搜索栏\n条件是与关系\n";
+    await write(src, body);
+    const hash = sha256(await readFile(src));
+    const loaded = await cfg(dir, [{ name: "notes", path: notes }]);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const prepared = await prepareReadonlyRoot(loaded, loaded.roots[0]);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    assert.equal(prepared.status, "created");
+    assert.equal(prepared.snapshot.docs.length, 1);
+    assert.equal(prepared.snapshot.docs[0].title, "搜索栏");
+    assert.equal(prepared.snapshot.docs[0].lines[1], "条件是与关系");
+    assert.equal(await readFile(src, "utf8"), body);
+    assert.equal(sha256(await readFile(src)), hash);
+    assert.match(prepared.path ?? "", /\.pi-kb\/snapshot\.json$/);
+    const again = await prepareReadonlyRoot(loaded, loaded.roots[0]);
+    assert.equal(again.ok, true);
+    if (!again.ok) return;
+    assert.equal(again.status, "reused");
+  });
+
+  it("maps ShowDoc hashed files to titles and catalogs", async () => {
+    const dir = await tmp();
+    const docs = join(dir, "showdoc");
+    await write(join(docs, "prefix_readme.md"), "搜索栏Searchbar —— prefix_aaa.md\n");
+    await write(join(docs, "prefix_aaa.md"), "搜索栏的所有条件之间是与关系，不支持或的关系\n");
+    await write(join(docs, "prefix_info.json"), JSON.stringify({
+      item_name: "demo",
+      pages: {
+        pages: [],
+        catalogs: [{
+          cat_name: "平台",
+          pages: [],
+          catalogs: [{
+            cat_name: "功能清单",
+            pages: [{ page_title: "搜索栏Searchbar" }],
+            catalogs: [],
+          }],
+        }],
+      },
+    }));
+    const loaded = await cfg(dir, [{ name: "showdoc", path: docs }]);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const prepared = await prepareReadonlyRoot(loaded, loaded.roots[0]);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    assert.equal(prepared.snapshot.docs.length, 1);
+    const doc = prepared.snapshot.docs[0];
+    assert.equal(doc.title, "搜索栏Searchbar");
+    assert.deepEqual(doc.catalog, ["平台", "功能清单"]);
+    assert.match(doc.lines[0], /不支持或/);
+    assert.ok(prepared.path);
+    assert.equal(prepared.path, sourceCachePath(loaded.roots[0].realPath ?? docs));
+  });
+
+  it("does not guess duplicate ShowDoc titles and rejects mapped escapes", async () => {
+    const dir = await tmp();
+    const docs = join(dir, "showdoc");
+    const outside = join(dir, "secret.md");
+    await write(outside, "leak\n");
+    await write(join(docs, "prefix_readme.md"), [
+      "重复 —— prefix_a.md",
+      "重复 —— prefix_b.md",
+      "逃逸 —— ../secret.md",
+      "普通README.md 不应被当成映射",
+    ].join("\n"));
+    await write(join(docs, "prefix_a.md"), "a\n");
+    await write(join(docs, "prefix_b.md"), "b\n");
+    await write(join(docs, "notes.md"), "# 普通笔记\n");
+    await write(join(docs, "data.json"), JSON.stringify({ hello: "world" }));
+    await write(join(docs, "prefix_info.json"), JSON.stringify({
+      pages: {
+        pages: [{ page_title: "重复" }, { page_title: "重复" }],
+        catalogs: [],
+      },
+    }));
+    const loaded = await cfg(dir, [{ name: "showdoc", path: docs }]);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const prepared = await prepareReadonlyRoot(loaded, loaded.roots[0]);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    const titles = prepared.snapshot.docs.map((d) => d.title).sort();
+    assert.ok(titles.includes("普通笔记"));
+    assert.ok(titles.includes("data"));
+    assert.equal(prepared.snapshot.docs.some((d) => d.path.endsWith("secret.md")), false);
+    assert.ok(prepared.snapshot.docs.every((d) => d.catalog.length === 0 || d.title !== "重复"));
+  });
+
+  it("search uses titles; dropped and changed files do not keep stale hits", async () => {
+    const dir = await tmp();
+    const docs = join(dir, "showdoc");
+    await write(join(docs, "prefix_readme.md"), "搜索栏Searchbar —— prefix_aaa.md\n");
+    await write(join(docs, "prefix_aaa.md"), "搜索栏的所有条件之间是与关系，不支持或的关系\n");
+    await write(join(docs, "gone.md"), "temporary-token\n");
+    const loaded = await cfg(dir, [{ name: "showdoc", path: docs }]);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const hit = await searchKb(loaded, "Searchbar 或", { root: "showdoc" });
+    assert.equal(hit.ok, true);
+    if (!hit.ok) return;
+    assert.equal(hit.hits.length, 1);
+    assert.equal(hit.hits[0].title, "搜索栏Searchbar");
+    assert.match(hit.hits[0].snippets[0].text, /不支持或/);
+
+    await unlink(join(docs, "gone.md"));
+    const gone = await searchKb(loaded, "temporary-token", { root: "showdoc" });
+    assert.equal(gone.ok, true);
+    if (!gone.ok) return;
+    assert.equal(gone.hits.length, 0);
+
+    await write(join(docs, "prefix_aaa.md"), "条件已改为支持或关系\n");
+    const changed = await searchKb(loaded, "Searchbar 或", { root: "showdoc" });
+    assert.equal(changed.ok, true);
+    if (!changed.ok) return;
+    assert.equal(changed.hits.length, 1);
+    assert.match(changed.hits[0].snippets[0].text, /支持或关系/);
+  });
+
+  it("truncated prepare does not overwrite a complete snapshot", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await write(join(notes, "keep.md"), "keep-me\n");
+    const loaded = await cfg(dir, [{ name: "notes", path: notes }]);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const first = await prepareReadonlyRoot(loaded, loaded.roots[0]);
+    assert.equal(first.ok, true);
+    if (!first.ok || !first.path) return;
+    const before = await readFile(first.path, "utf8");
+    const ac = new AbortController();
+    ac.abort();
+    const truncated = await prepareReadonlyRoot(loaded, loaded.roots[0], { signal: ac.signal });
+    assert.equal(truncated.ok, true);
+    if (!truncated.ok) return;
+    assert.equal(truncated.status, "memory_only");
+    assert.equal(truncated.snapshot.truncated, true);
+    assert.equal(await readFile(first.path, "utf8"), before);
   });
 });

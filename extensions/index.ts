@@ -8,24 +8,30 @@ import { Type } from "typebox";
 import {
   CONFIG_FILENAME,
   DEFAULT_LIMIT,
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  DEFAULT_TIMEOUT_MS,
   MAX_LIMIT,
   OUTPUT_MAX,
+  configureKbInteractive,
   existingDigestPath,
   formatSearch,
   isOriginalTextFile,
   isTruncatedReadResult,
   loadConfigFile,
-  configureKbInteractive,
   normalizeReadRef,
   pathKey,
+  prepareReadonlyRoot,
   searchKb,
   sha256,
   sourceTitleFrom,
   writeDigest,
   writeLesson,
+  type EnrichHooks,
+  type EnrichSettings,
   type LoadedConfig,
   type ReadRef,
 } from "../lib/kb.ts";
+import { pauseJob, startEnrichment, type ModelComplete } from "../lib/semantic.ts";
 
 export type KbOptions = {
   configPath?: string;
@@ -58,6 +64,76 @@ function policy(config: LoadedConfig): string {
   ].join("\n");
 }
 
+function modelLabel(provider: string, id: string): string {
+  return `${provider}/${id}`;
+}
+
+function makeComplete(ctx: { modelRegistry?: { find?: Function; complete?: Function } }, enrich: EnrichSettings): ModelComplete {
+  return async (input) => {
+    const registry = ctx.modelRegistry;
+    if (!registry?.find || !registry?.complete) throw new Error("当前 Pi 不支持独立清洗模型");
+    const model = registry.find(enrich.provider, enrich.model);
+    if (!model) throw new Error(`找不到清洗模型 ${modelLabel(enrich.provider, enrich.model)}`);
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), input.timeoutMs);
+    if (input.signal?.aborted) ac.abort();
+    else input.signal?.addEventListener("abort", () => ac.abort(), { once: true });
+    try {
+      const msg = await registry.complete(model, {
+        systemPrompt: input.system,
+        messages: [{ role: "user", content: input.user, timestamp: Date.now() }],
+      }, { maxTokens: input.maxTokens, signal: ac.signal });
+      const text = Array.isArray(msg?.content)
+        ? msg.content.map((part: { type?: string; text?: string }) => part?.type === "text" ? String(part.text ?? "") : "").join("")
+        : String(msg?.errorMessage ?? "");
+      if (msg?.stopReason === "error" || msg?.errorMessage) throw new Error(String(msg.errorMessage ?? "模型错误"));
+      return {
+        text,
+        inputTokens: Number(msg?.usage?.input ?? 0),
+        outputTokens: Number(msg?.usage?.output ?? 0),
+        costUnknown: !msg?.usage,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
+function enrichHooksFor(ctx: any, configPath: string, home: string): EnrichHooks {
+  return {
+    async resolveModel(current) {
+      const registry = ctx?.modelRegistry;
+      if (!registry?.getAvailable) return { ok: false as const, error: "当前 Pi 不支持独立清洗模型" };
+      const models = registry.getAvailable() as { provider: string; id: string }[];
+      if (current && models.some((m) => m.provider === current.provider && m.id === current.model)) {
+        const keep = await ctx.ui.confirm("使用已配置的清洗模型？", modelLabel(current.provider, current.model));
+        if (keep) return current;
+      }
+      if (!models.length) return { ok: false as const, error: "没有可用模型" };
+      const picked = await ctx.ui.select("选择清洗模型", models.map((m) => modelLabel(m.provider, m.id)));
+      if (!picked) return;
+      const slash = picked.indexOf("/");
+      return {
+        provider: slash < 0 ? picked : picked.slice(0, slash),
+        model: slash < 0 ? picked : picked.slice(slash + 1),
+        maxOutputTokens: current?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+        timeoutMs: current?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      };
+    },
+    async start(loaded, rootName) {
+      if (!loaded.enrich) return "未配置清洗模型";
+      return startEnrichment(loaded, rootName, makeComplete(ctx, loaded.enrich));
+    },
+    async pause(rootName) {
+      const loaded = await loadConfigFile(configPath, home);
+      if (!loaded.ok) return loaded.error;
+      const root = loaded.roots.find((r) => r.name === rootName);
+      if (!root?.realPath) return "没有这个目录";
+      return pauseJob(root.realPath);
+    },
+  };
+}
+
 function textOf(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -84,6 +160,10 @@ export function createKbExtension(opts: KbOptions = {}) {
 
     pi.on("session_start", async () => {
       await reload();
+      if (!config.ok) return;
+      for (const root of config.roots.filter((r) => !r.writable && r.exists)) {
+        await prepareReadonlyRoot(config, root);
+      }
     });
 
     pi.on("session_shutdown", () => {
@@ -170,11 +250,29 @@ export function createKbExtension(opts: KbOptions = {}) {
       description: "查看或配置知识库目录",
       handler: async (_args, ctx) => {
         const configPath = opts.configPath ?? join(getAgentDir(), CONFIG_FILENAME);
+        const args = String(_args ?? "").trim();
+        const hooks = enrichHooksFor(ctx, configPath, home);
         if (!ctx.hasUI) {
           config = await loadConfigFile(configPath, home);
+          if (!config.ok) return;
+          const [cmd, name] = args.split(/\s+/, 2);
+          if (!cmd || cmd === "refresh") {
+            for (const root of config.roots.filter((r) => !r.writable && (!name || r.name === name))) {
+              await prepareReadonlyRoot(config, root);
+            }
+            return;
+          }
+          if (cmd === "enrich" && name) {
+            if (!config.enrich) return;
+            await startEnrichment(config, name, makeComplete(ctx, config.enrich));
+            return;
+          }
+          if (cmd === "pause" && name) {
+            await hooks.pause?.(name);
+          }
           return;
         }
-        config = await configureKbInteractive(configPath, ctx.ui, home);
+        config = await configureKbInteractive(configPath, ctx.ui, home, hooks);
       },
     });
 

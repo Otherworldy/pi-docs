@@ -6,6 +6,7 @@ import {
 } from "node:fs";
 import {
   access,
+  chmod,
   copyFile,
   lstat,
   mkdir,
@@ -33,7 +34,7 @@ import {
 export const CONFIG_FILENAME = "pi-kb.json";
 export const AUTHOR = "pi-agent";
 export const TEXT_EXTS = new Set([".md", ".mdx", ".txt", ".html", ".htm", ".json", ".yaml", ".yml"]);
-export const SKIP_DIRS = new Set([".git", ".obsidian", "node_modules"]);
+export const SKIP_DIRS = new Set([".git", ".obsidian", "node_modules", ".pi-kb", "pi-kb-cache"]);
 export const QUERY_MAX = 512;
 export const TITLE_MAX = 120;
 export const BODY_MAX = 16 * 1024;
@@ -45,12 +46,26 @@ export const FILE_MAX = 1024 * 1024;
 export const MAX_DIRENTS = 10_000;
 export const MAX_BODY_BYTES = 32 * 1024 * 1024;
 export const SCAN_MS = 5000;
+export const RULE_VERSION = 1;
+export const CACHE_DIRNAME = ".pi-kb";
+export const LEGACY_CACHE_DIRNAME = "pi-kb-cache";
+export const SNAPSHOT_MAX = 32 * 1024 * 1024;
+
+export const DEFAULT_MAX_OUTPUT_TOKENS = 2048;
+export const DEFAULT_TIMEOUT_MS = 60_000;
 
 export type RootInput = {
   name: string;
   path: string;
   writable?: boolean;
   exclude?: string[];
+};
+
+export type EnrichSettings = {
+  provider: string;
+  model: string;
+  maxOutputTokens: number;
+  timeoutMs: number;
 };
 
 export type LoadedRoot = {
@@ -68,6 +83,7 @@ export type LoadedConfig = {
   configPath: string;
   roots: LoadedRoot[];
   writable?: LoadedRoot;
+  enrich?: EnrichSettings;
 } | {
   ok: false;
   configPath: string;
@@ -88,12 +104,16 @@ export type SearchHit = {
   root: string;
   path: string;
   relPath: string;
+  title?: string;
+  catalog?: string[];
   sourcePath?: string;
   sourceStatus?: "unchanged" | "changed" | "missing" | "out-of-scope" | "unverified";
   pathHit: boolean;
   snippets: Snippet[];
   preview?: string;
   pathScore: number;
+  semanticMatch?: boolean;
+  semanticEvidence?: string;
 };
 
 export type SearchOk = {
@@ -114,6 +134,39 @@ export type WriteOk = {
 };
 
 export type Fail = { ok: false; error: string };
+
+export type PreparedDoc = {
+  path: string;
+  relPath: string;
+  title: string;
+  catalog: string[];
+  sourceHash: string;
+  lines: string[];
+};
+
+export type PreparedSnapshot = {
+  version: number;
+  sourceName: string;
+  sourcePath: string;
+  sourceKey: string;
+  exclude: string[];
+  metaFingerprint: string;
+  docs: PreparedDoc[];
+  skipped: number;
+  skipReasons: string[];
+  truncated: boolean;
+  preparedAt: string;
+};
+
+export type PrepareOk = {
+  ok: true;
+  snapshot: PreparedSnapshot;
+  status: "created" | "reused" | "updated" | "memory_only";
+  path?: string;
+  processed: number;
+  updated: number;
+  persistError?: string;
+};
 
 export type Budget = {
   deadline: number;
@@ -212,7 +265,29 @@ export function foldSpace(text: string): string {
   return text.replace(/[ \t]+/g, " ");
 }
 
-export function parseConfigJson(raw: unknown): { ok: true; roots: RootInput[] } | Fail {
+export function parseEnrichSettings(raw: unknown): EnrichSettings | Fail | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "enrich 必须是对象" };
+  const rec = raw as Record<string, unknown>;
+  if (typeof rec.provider !== "string" || !rec.provider.trim()) return { ok: false, error: "enrich.provider 不能为空" };
+  if (typeof rec.model !== "string" || !rec.model.trim()) return { ok: false, error: "enrich.model 不能为空" };
+  const maxOutputTokens = rec.maxOutputTokens === undefined ? DEFAULT_MAX_OUTPUT_TOKENS : rec.maxOutputTokens;
+  const timeoutMs = rec.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : rec.timeoutMs;
+  if (typeof maxOutputTokens !== "number" || !Number.isInteger(maxOutputTokens) || maxOutputTokens < 16 || maxOutputTokens > 8192) {
+    return { ok: false, error: "enrich.maxOutputTokens 无效" };
+  }
+  if (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 300_000) {
+    return { ok: false, error: "enrich.timeoutMs 无效" };
+  }
+  return {
+    provider: rec.provider.trim(),
+    model: rec.model.trim(),
+    maxOutputTokens,
+    timeoutMs,
+  };
+}
+
+export function parseConfigJson(raw: unknown): { ok: true; roots: RootInput[]; enrich?: EnrichSettings } | Fail {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "配置必须是对象" };
   const roots = (raw as { roots?: unknown }).roots;
   if (!Array.isArray(roots)) return { ok: false, error: "缺少 roots 数组" };
@@ -243,7 +318,9 @@ export function parseConfigJson(raw: unknown): { ok: true; roots: RootInput[] } 
       exclude: (rec.exclude as string[] | undefined) ?? [],
     });
   }
-  return { ok: true, roots: out };
+  const enrich = parseEnrichSettings((raw as { enrich?: unknown }).enrich);
+  if (enrich && "ok" in enrich) return enrich;
+  return { ok: true, roots: out, enrich };
 }
 
 export async function loadConfigFile(configPath: string, home = homedir()): Promise<LoadedConfig> {
@@ -291,6 +368,7 @@ export async function loadConfigFile(configPath: string, home = homedir()): Prom
     configPath,
     roots,
     writable: roots.find((r) => r.writable),
+    enrich: spec.enrich,
   };
 }
 
@@ -565,8 +643,34 @@ async function readUtf8Limited(path: string, b: Budget): Promise<{ text: string;
   return { text, buf };
 }
 
-function asLines(text: string): string[] {
+export function asLines(text: string): string[] {
   return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+}
+
+export function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+export function normalizeNoteLines(text: string): string[] {
+  return asLines(stripBom(text)).map((line) => decodeEntities(line));
+}
+
+export function extractNoteTitle(text: string): string | undefined {
+  const lines = asLines(stripBom(text));
+  let fence: string | undefined;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const mark = /^(```+|~~~+)/.exec(trimmed);
+    if (mark) {
+      const ch = mark[1][0];
+      if (!fence) fence = ch;
+      else if (ch === fence) fence = undefined;
+      continue;
+    }
+    if (fence) continue;
+    const heading = /^(#{1,6})\s+(\S.*)$/.exec(trimmed);
+    if (heading) return heading[2].trim().slice(0, TITLE_MAX);
+  }
 }
 
 function matchFile(
@@ -700,6 +804,90 @@ async function searchLayer(
   return hits;
 }
 
+type SemanticIndex = {
+  path: string;
+  sourceHash: string;
+  topics?: unknown;
+  aliases?: unknown;
+  questions?: unknown;
+  rules?: unknown;
+};
+
+async function loadSemanticIndex(sourcePath: string): Promise<SemanticIndex[]> {
+  try {
+    const p = join(cacheDirFor(sourcePath), "sem.json");
+    const st = await lstat(p);
+    if (!st.isFile() || st.isSymbolicLink() || st.size > SNAPSHOT_MAX) return [];
+    const raw = JSON.parse(await readFile(p, "utf8")) as { records?: unknown };
+    if (!Array.isArray(raw.records)) return [];
+    return raw.records.filter((r): r is SemanticIndex => !!r && typeof r === "object" && typeof (r as SemanticIndex).path === "string" && typeof (r as SemanticIndex).sourceHash === "string");
+  } catch {
+    return [];
+  }
+}
+
+function stringsOf(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : [];
+}
+
+function semanticExtra(rec: SemanticIndex | undefined): string {
+  if (!rec) return "";
+  const rules = Array.isArray(rec.rules)
+    ? rec.rules.map((rule) => (rule && typeof rule === "object" ? `${(rule as { text?: string }).text ?? ""} ${(rule as { excerpt?: string }).excerpt ?? ""}` : "")).join("\n")
+    : "";
+  return [...stringsOf(rec.topics), ...stringsOf(rec.aliases), ...stringsOf(rec.questions), rules].join("\n");
+}
+
+function semanticEvidence(rec: SemanticIndex, terms: string[]): string | undefined {
+  const fields = [...stringsOf(rec.topics), ...stringsOf(rec.aliases), ...stringsOf(rec.questions)];
+  if (Array.isArray(rec.rules)) {
+    for (const rule of rec.rules) {
+      if (rule && typeof rule === "object" && typeof (rule as { text?: string }).text === "string") fields.push((rule as { text: string }).text);
+    }
+  }
+  const hit = fields.find((field) => terms.some((term) => field.toLowerCase().includes(term.toLowerCase())));
+  return hit?.slice(0, SNIPPET_MAX);
+}
+
+function hitsFromPrepared(snapshot: PreparedSnapshot, terms: string[], rootName: string, records: SemanticIndex[] = []): SearchHit[] {
+  const byPath = new Map(records.map((r) => [pathKey(r.path), r]));
+  const hits: SearchHit[] = [];
+  for (const doc of snapshot.docs) {
+    const rec = byPath.get(pathKey(doc.path));
+    const usable = rec && rec.sourceHash === doc.sourceHash ? rec : undefined;
+    const titleExtra = `${doc.title}\n${doc.catalog.join(" / ")}`;
+    const text = doc.lines.join("\n");
+    const base = matchFile(terms, doc.relPath, text, titleExtra);
+    const matched = base ?? matchFile(terms, doc.relPath, text, `${titleExtra}\n${semanticExtra(usable)}`);
+    if (!matched) continue;
+    const semanticOnly = !base && !!usable;
+    hits.push({
+      kind: "original",
+      root: rootName,
+      path: doc.path,
+      relPath: doc.relPath,
+      title: doc.title,
+      catalog: doc.catalog,
+      pathHit: matched.pathHit,
+      snippets: matched.snippets,
+      preview: matched.preview,
+      pathScore: matched.pathScore + (usable ? 1 : 0),
+      semanticMatch: semanticOnly || undefined,
+      semanticEvidence: semanticOnly ? semanticEvidence(usable, terms) : undefined,
+    });
+  }
+  hits.sort((a, b) => b.pathScore - a.pathScore || a.path.localeCompare(b.path));
+  return hits;
+}
+
+function mergeSkip(b: Budget, snapshot: PreparedSnapshot): void {
+  b.truncated = b.truncated || snapshot.truncated;
+  b.skipped += snapshot.skipped;
+  for (const reason of snapshot.skipReasons) {
+    if (b.reasons.length < 8 && !b.reasons.includes(reason)) b.reasons.push(reason);
+  }
+}
+
 export async function searchKb(
   config: LoadedConfig,
   query: string,
@@ -722,12 +910,26 @@ export async function searchKb(
       }
       return { ok: false, error: `root 目录不存在: ${root.name} (${root.path})` };
     }
-    const skipInside = root.writable ? [] : writableReal;
-    const hits = await searchLayer(config, [root], skipInside, terms, root.writable ? "ai" : "original", b);
+    if (root.writable) {
+      const hits = await searchLayer(config, [root], [], terms, "ai", b);
+      return {
+        ok: true,
+        hits: hits.slice(0, limit),
+        originalsSearched: false,
+        truncated: b.truncated,
+        skipped: b.skipped,
+        skipReasons: b.reasons,
+      };
+    }
+    const prepared = await prepareReadonlyRoot(config, root, { signal: opts.signal });
+    if (!prepared.ok) return prepared;
+    mergeSkip(b, prepared.snapshot);
+    const records = await loadSemanticIndex(prepared.snapshot.sourcePath);
+    const hits = hitsFromPrepared(prepared.snapshot, terms, root.name, records);
     return {
       ok: true,
       hits: hits.slice(0, limit),
-      originalsSearched: !root.writable,
+      originalsSearched: true,
       truncated: b.truncated,
       skipped: b.skipped,
       skipReasons: b.reasons,
@@ -755,7 +957,14 @@ export async function searchKb(
   if (missing.length && originalRoots.every((r) => !r.exists)) {
     return { ok: false, error: `只读 root 不存在: ${missing.map((r) => r.name).join(", ")}` };
   }
-  const origHits = await searchLayer(config, originalRoots.filter((r) => r.exists), writableReal, terms, "original", b);
+  const origHits: SearchHit[] = [];
+  for (const root of originalRoots.filter((r) => r.exists)) {
+    const prepared = await prepareReadonlyRoot(config, root, { signal: opts.signal });
+    if (!prepared.ok) return prepared;
+    mergeSkip(b, prepared.snapshot);
+    origHits.push(...hitsFromPrepared(prepared.snapshot, terms, root.name, await loadSemanticIndex(prepared.snapshot.sourcePath)));
+  }
+  origHits.sort((a, b) => b.pathScore - a.pathScore || a.path.localeCompare(b.path));
   return {
     ok: true,
     hits: origHits.slice(0, limit),
@@ -780,9 +989,11 @@ export function formatSearch(result: SearchOk): string {
   for (const hit of result.hits) {
     const status = hit.sourceStatus ? ` 来源${hit.sourceStatus}` : "";
     lines.push("", `## ${hit.kind}  root=${hit.root}${status}`);
+    if (hit.title) lines.push(`标题: ${hit.title}${hit.catalog?.length ? `  ${hit.catalog.join(" / ")}` : ""}`);
     lines.push(hit.path);
     if (hit.sourcePath) lines.push(`来源: ${hit.sourcePath}`);
     if (hit.pathHit) lines.push(`文件名/路径命中${hit.preview ? `: ${hit.preview}` : ""}`);
+    if (hit.semanticMatch) lines.push(`语义索引匹配${hit.semanticEvidence ? `: ${hit.semanticEvidence}` : ""}`);
     for (const s of hit.snippets) lines.push(`L${s.line}: ${s.text}`);
   }
   return lines.join("\n");
@@ -963,6 +1174,8 @@ export function formatStatus(config: LoadedConfig): string {
   }
   lines.push("策略: AI 笔记优先；完整读原文后可整理；不改原笔记");
   lines.push(`格式: ${[...TEXT_EXTS].join(" ")}`);
+  if (config.enrich) lines.push(`清洗模型: ${config.enrich.provider}/${config.enrich.model}`);
+  else lines.push("清洗模型: 未配置（导入时可选择）");
   for (const root of config.roots) {
     const rw = root.writable ? "可写" : "只读";
     const ex = root.exclude.length ? ` exclude=${root.exclude.join("|")}` : "";
@@ -982,6 +1195,12 @@ export type KbUi = {
   input(title: string, placeholder?: string): Promise<string | undefined>;
   confirm(title: string, message: string): Promise<boolean>;
   notify(text: string, level?: "info" | "warning" | "error"): void;
+};
+
+export type EnrichHooks = {
+  resolveModel(current?: EnrichSettings): Promise<EnrichSettings | Fail | undefined>;
+  start(config: Extract<LoadedConfig, { ok: true }>, rootName: string): Promise<string>;
+  pause?(rootName: string): Promise<string>;
 };
 
 export function snapshotRoots(config: LoadedConfig): RootInput[] {
@@ -1021,12 +1240,20 @@ export async function saveConfigFile(
   configPath: string,
   roots: RootInput[],
   home = homedir(),
+  enrich?: EnrichSettings | null,
 ): Promise<LoadedConfig> {
-  const spec = parseConfigJson({ roots });
+  let nextEnrich = enrich;
+  if (nextEnrich === undefined) {
+    const existing = await loadConfigFile(configPath, home);
+    if (existing.ok) nextEnrich = existing.enrich;
+  } else if (nextEnrich === null) {
+    nextEnrich = undefined;
+  }
+  const spec = parseConfigJson({ roots, enrich: nextEnrich });
   if (!spec.ok) return { ok: false, configPath, error: spec.error };
-  const body = `${JSON.stringify({
+  const payload: { roots: RootInput[]; enrich?: EnrichSettings } = {
     roots: spec.roots.map((r) => {
-      const o: { name: string; path: string; writable?: boolean; exclude?: string[] } = {
+      const o: RootInput = {
         name: r.name,
         path: r.path,
       };
@@ -1034,7 +1261,9 @@ export async function saveConfigFile(
       if (r.exclude.length) o.exclude = r.exclude;
       return o;
     }),
-  }, null, 2)}\n`;
+  };
+  if (spec.enrich) payload.enrich = spec.enrich;
+  const body = `${JSON.stringify(payload, null, 2)}\n`;
   await mkdir(dirname(configPath), { recursive: true });
   const tmpPath = join(dirname(configPath), `.pi-kb-${randomUUID()}.tmp`);
   try {
@@ -1052,10 +1281,51 @@ export async function saveConfigFile(
   return loadConfigFile(configPath, home);
 }
 
+async function afterAddReadonly(
+  config: Extract<LoadedConfig, { ok: true }>,
+  name: string,
+  ui: KbUi,
+  hooks: EnrichHooks | undefined,
+  configPath: string,
+  home: string,
+): Promise<LoadedConfig> {
+  const root = config.roots.find((r) => r.name === name);
+  if (!root || root.writable) return config;
+  if (!root.exists) {
+    ui.notify(`目录已保存，但路径不存在: ${root.path}`, "warning");
+    return config;
+  }
+  ui.notify(`正在处理 ${name}…`);
+  const prepared = await prepareReadonlyRoot(config, root);
+  if (!prepared.ok) {
+    ui.notify(`目录已保存，资料生成失败: ${prepared.error}`, "error");
+    return config;
+  }
+  const extra = prepared.persistError ? `；${prepared.persistError}` : "";
+  ui.notify(`规则清洗完成：${prepared.processed} 篇${extra}`);
+  if (!hooks) return config;
+  const useAi = await ui.confirm("使用 AI 全量语义整理？", `${name} 共 ${prepared.processed} 篇。仅规则清洗也可搜索。`);
+  if (!useAi) return config;
+  const model = await hooks.resolveModel(config.enrich);
+  if (!model) return config;
+  if ("ok" in model) {
+    ui.notify(model.error, "error");
+    return config;
+  }
+  const saved = await saveConfigFile(configPath, snapshotRoots(config), home, model);
+  if (!saved.ok) {
+    ui.notify(saved.error, "error");
+    return config;
+  }
+  ui.notify(await hooks.start(saved, name));
+  return saved;
+}
+
 export async function configureKbInteractive(
   configPath: string,
   ui: KbUi,
   home = homedir(),
+  hooks?: EnrichHooks,
 ): Promise<LoadedConfig> {
   let config = await loadConfigFile(configPath, home);
   if (!config.ok && !config.error.includes("不存在")) {
@@ -1068,11 +1338,51 @@ export async function configureKbInteractive(
   for (;;) {
     const roots = snapshotRoots(config);
     const options = ["完成", "添加目录"];
-    if (roots.length) options.push("删除目录", "设为记录目录");
+    if (roots.length) options.push("删除目录", "设为记录目录", "刷新资料");
+    if (roots.some((r) => !r.writable)) options.push("AI 整理", "暂停 AI");
     const choice = await ui.select(formatStatus(config), options);
     if (!choice || choice === "完成") {
       ui.notify(formatStatus(config));
       return config;
+    }
+    if (choice === "刷新资料" || choice === "AI 整理" || choice === "暂停 AI") {
+      if (!config.ok) continue;
+      const readonlyNames = config.roots.filter((r) => !r.writable).map((r) => r.name);
+      if (choice === "刷新资料") {
+        const name = await ui.select("刷新哪个目录？", readonlyNames);
+        if (!name) continue;
+        const root = config.roots.find((r) => r.name === name);
+        if (!root) continue;
+        const prepared = await prepareReadonlyRoot(config, root);
+        ui.notify(prepared.ok ? `已刷新 ${name}：${prepared.processed} 篇 ${prepared.status}` : prepared.error, prepared.ok ? "info" : "error");
+        continue;
+      }
+      if (choice === "AI 整理") {
+        if (!hooks) {
+          ui.notify("当前环境不能调用清洗模型", "error");
+          continue;
+        }
+        const name = await ui.select("整理哪个目录？", readonlyNames);
+        if (!name) continue;
+        const model = await hooks.resolveModel(config.enrich);
+        if (!model) continue;
+        if ("ok" in model) {
+          ui.notify(model.error, "error");
+          continue;
+        }
+        const savedModel = await saveConfigFile(configPath, snapshotRoots(config), home, model);
+        if (!savedModel.ok) {
+          ui.notify(savedModel.error, "error");
+          continue;
+        }
+        config = savedModel;
+        ui.notify(await hooks.start(savedModel, name));
+        continue;
+      }
+      const name = await ui.select("暂停哪个目录？", readonlyNames);
+      if (!name) continue;
+      ui.notify(hooks?.pause ? await hooks.pause(name) : "没有进行中的任务");
+      continue;
     }
     let change: RootChange | undefined;
     if (choice === "添加目录") {
@@ -1105,13 +1415,406 @@ export async function configureKbInteractive(
     const saved = await saveConfigFile(configPath, applied.roots, home);
     config = saved;
     ui.notify(saved.ok ? "已保存" : saved.error, saved.ok ? "info" : "error");
+    if (saved.ok && change.op === "add" && !change.writable) {
+      config = await afterAddReadonly(saved, change.name, ui, hooks, configPath, home);
+    }
   }
 }
 
 export function isOriginalTextFile(config: Extract<LoadedConfig, { ok: true }>, realPath: string): boolean {
   if (!TEXT_EXTS.has(extname(realPath).toLowerCase())) return false;
+  const owner = mostSpecificRoot(realPath, config.roots);
+  if (owner && pathInside(realPath, cacheDirFor(owner.realPath ?? owner.path))) return false;
   if (config.writable?.realPath && pathInside(realPath, config.writable.realPath)) return false;
-  if (!mostSpecificRoot(realPath, config.roots)) return false;
+  if (!owner) return false;
   if (coveredAndExcluded(realPath, config.roots)) return false;
   return true;
+}
+
+export function cacheDirFor(sourcePath: string): string {
+  return join(sourcePath, CACHE_DIRNAME);
+}
+
+export function sourceCachePath(sourcePath: string): string {
+  return join(cacheDirFor(sourcePath), "snapshot.json");
+}
+
+async function migrateLegacyCache(configPath: string, sourcePath: string): Promise<void> {
+  const destDir = cacheDirFor(sourcePath);
+  const destSnap = join(destDir, "snapshot.json");
+  try {
+    await access(destSnap, constants.F_OK);
+    return;
+  } catch {
+    /* missing */
+  }
+  const hash = sha256(pathKey(sourcePath));
+  const oldDir = join(dirname(resolve(configPath)), LEGACY_CACHE_DIRNAME);
+  const mapping: [string, string][] = [
+    [`${hash}.json`, "snapshot.json"],
+    [`job-${hash}.json`, "job.json"],
+    [`sem-${hash}.json`, "sem.json"],
+  ];
+  let found = false;
+  for (const [from] of mapping) {
+    try {
+      await access(join(oldDir, from), constants.F_OK);
+      found = true;
+      break;
+    } catch {
+      /* skip */
+    }
+  }
+  if (!found) return;
+  await mkdir(destDir, { recursive: true, mode: 0o700 });
+  for (const [from, to] of mapping) {
+    try {
+      await copyFile(join(oldDir, from), join(destDir, to), constants.COPYFILE_EXCL);
+    } catch {
+      /* skip */
+    }
+  }
+}
+
+export function parseShowDocReadme(text: string): Map<string, string> {
+  const fileToTitle = new Map<string, string>();
+  const conflict = new Set<string>();
+  for (const line of asLines(text)) {
+    const m = line.match(/^\s*(.+?)\s+(?:——|--)\s+(\S+\.[A-Za-z0-9]+)\s*$/);
+    if (!m) continue;
+    const title = m[1].trim();
+    const file = m[2].replaceAll("\\", "/");
+    if (!title || file.includes("..")) {
+      conflict.add(file);
+      continue;
+    }
+    const prev = fileToTitle.get(file);
+    if (prev && prev !== title) conflict.add(file);
+    else fileToTitle.set(file, title);
+  }
+  for (const file of conflict) fileToTitle.delete(file);
+  return fileToTitle;
+}
+
+function isShowDocInfo(raw: unknown): raw is { pages: { pages?: unknown[]; catalogs?: unknown[] } } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const pages = (raw as { pages?: unknown }).pages;
+  if (!pages || typeof pages !== "object" || Array.isArray(pages)) return false;
+  const rec = pages as { pages?: unknown; catalogs?: unknown };
+  return Array.isArray(rec.pages) || Array.isArray(rec.catalogs);
+}
+
+function collectShowDocCatalogs(
+  node: { pages?: unknown[]; catalogs?: unknown[] },
+  parents: string[],
+  out: Map<string, string[]>,
+  dups: Set<string>,
+): void {
+  for (const page of node.pages ?? []) {
+    if (!page || typeof page !== "object") continue;
+    const title = (page as { page_title?: unknown }).page_title;
+    if (typeof title !== "string" || !title.trim()) continue;
+    const key = title.trim();
+    if (out.has(key) || dups.has(key)) {
+      dups.add(key);
+      out.delete(key);
+      continue;
+    }
+    out.set(key, parents);
+  }
+  for (const cat of node.catalogs ?? []) {
+    if (!cat || typeof cat !== "object") continue;
+    const rec = cat as { cat_name?: unknown; pages?: unknown[]; catalogs?: unknown[] };
+    const name = typeof rec.cat_name === "string" ? rec.cat_name.trim() : "";
+    collectShowDocCatalogs(rec, name ? [...parents, name] : parents, out, dups);
+  }
+}
+
+export function parseShowDocInfo(raw: unknown): Map<string, string[]> | null {
+  if (!isShowDocInfo(raw)) return null;
+  const out = new Map<string, string[]>();
+  const dups = new Set<string>();
+  collectShowDocCatalogs(raw.pages, [], out, dups);
+  return out;
+}
+
+function isPreparedDoc(raw: unknown): raw is PreparedDoc {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const rec = raw as Record<string, unknown>;
+  return typeof rec.path === "string"
+    && typeof rec.relPath === "string"
+    && typeof rec.title === "string"
+    && Array.isArray(rec.catalog) && rec.catalog.every((x) => typeof x === "string")
+    && typeof rec.sourceHash === "string"
+    && Array.isArray(rec.lines) && rec.lines.every((x) => typeof x === "string");
+}
+
+export function parsePreparedSnapshot(raw: unknown): PreparedSnapshot | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  if (rec.version !== RULE_VERSION) return null;
+  if (typeof rec.sourceName !== "string" || typeof rec.sourcePath !== "string" || typeof rec.sourceKey !== "string") return null;
+  if (!Array.isArray(rec.exclude) || rec.exclude.some((x) => typeof x !== "string")) return null;
+  if (typeof rec.metaFingerprint !== "string" || typeof rec.preparedAt !== "string") return null;
+  if (!Array.isArray(rec.docs) || rec.docs.some((d) => !isPreparedDoc(d))) return null;
+  if (typeof rec.skipped !== "number" || typeof rec.truncated !== "boolean") return null;
+  if (!Array.isArray(rec.skipReasons) || rec.skipReasons.some((x) => typeof x !== "string")) return null;
+  return rec as PreparedSnapshot;
+}
+
+async function readSnapshotFile(path: string): Promise<PreparedSnapshot | null> {
+  try {
+    const st = await lstat(path);
+    if (!st.isFile() || st.isSymbolicLink() || st.size > SNAPSHOT_MAX) return null;
+    const buf = await readFile(path);
+    if (buf.includes(0)) return null;
+    return parsePreparedSnapshot(JSON.parse(buf.toString("utf8")) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+async function publishSnapshot(path: string, snapshot: PreparedSnapshot): Promise<Fail | { ok: true }> {
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const dirSt = await lstat(dir);
+  if (dirSt.isSymbolicLink() || !dirSt.isDirectory()) return { ok: false, error: "生成资料目录无效" };
+  const tmpPath = join(dir, `.pi-kb-cache-${randomUUID()}.tmp`);
+  try {
+    await writeFile(tmpPath, `${JSON.stringify(snapshot)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    try {
+      await chmod(tmpPath, 0o600);
+    } catch {
+      /* windows */
+    }
+    await rename(tmpPath, path);
+    return { ok: true };
+  } catch (err) {
+    try {
+      await unlink(tmpPath);
+    } catch {
+      /* ignore */
+    }
+    const code = (err as NodeJS.ErrnoException).code;
+    return { ok: false, error: `无法写入生成资料: ${code ?? "unknown"}` };
+  }
+}
+
+type ScannedFile = {
+  realPath: string;
+  relPath: string;
+  dir: string;
+  name: string;
+  text: string;
+  hash: string;
+};
+
+async function resolveMappedFile(
+  dir: string,
+  filename: string,
+  root: LoadedRoot,
+): Promise<string | undefined> {
+  const abs = resolve(dir, filename);
+  const base = root.realPath;
+  if (!base) return;
+  try {
+    const st = await lstat(abs);
+    if (!st.isFile() || st.isSymbolicLink()) return;
+    const real = await realpath(abs);
+    if (!pathInside(real, base) && !samePath(real, base)) return;
+    if (coveredAndExcluded(real, [root])) return;
+    return real;
+  } catch {
+    return;
+  }
+}
+
+async function showDocMaps(
+  files: ScannedFile[],
+  root: LoadedRoot,
+  b: Budget,
+): Promise<{ fileToTitle: Map<string, string>; titleToCatalog: Map<string, string[]>; skipMeta: Set<string> }> {
+  const fileToTitle = new Map<string, string>();
+  const titleToCatalog = new Map<string, string[]>();
+  const skipMeta = new Set<string>();
+  const groups = new Map<string, ScannedFile[]>();
+  for (const file of files) {
+    const key = pathKey(file.dir);
+    const list = groups.get(key) ?? [];
+    list.push(file);
+    groups.set(key, list);
+  }
+  for (const group of groups.values()) {
+    for (const file of group) {
+      if (/_readme\.md$/i.test(file.name)) {
+        const parsed = parseShowDocReadme(file.text);
+        if (parsed.size === 0) continue;
+        let used = 0;
+        for (const [name, title] of parsed) {
+          const real = await resolveMappedFile(file.dir, name, root);
+          if (!real) {
+            skip(b, "showdoc-out-of-scope");
+            continue;
+          }
+          const prev = fileToTitle.get(pathKey(real));
+          if (prev && prev !== title) {
+            fileToTitle.delete(pathKey(real));
+            skip(b, "showdoc-dup-title");
+            continue;
+          }
+          fileToTitle.set(pathKey(real), title);
+          used += 1;
+        }
+        if (used > 0) skipMeta.add(pathKey(file.realPath));
+      } else if (/_info\.json$/i.test(file.name)) {
+        let raw: unknown;
+        try {
+          raw = JSON.parse(file.text) as unknown;
+        } catch {
+          skip(b, "showdoc-info-invalid");
+          continue;
+        }
+        const catalogs = parseShowDocInfo(raw);
+        if (!catalogs) {
+          skip(b, "showdoc-info-invalid");
+          continue;
+        }
+        for (const [title, catalog] of catalogs) {
+          const prev = titleToCatalog.get(title);
+          if (prev && prev.join("/") !== catalog.join("/")) {
+            titleToCatalog.delete(title);
+            skip(b, "showdoc-dup-title");
+            continue;
+          }
+          titleToCatalog.set(title, catalog);
+        }
+        skipMeta.add(pathKey(file.realPath));
+      }
+    }
+  }
+  return { fileToTitle, titleToCatalog, skipMeta };
+}
+
+function snapshotFingerprint(snapshot: Pick<PreparedSnapshot, "sourceKey" | "exclude" | "metaFingerprint" | "docs">): string {
+  const docs = snapshot.docs.map((d) => `${pathKey(d.path)}:${d.sourceHash}`).sort();
+  return sha256(JSON.stringify({
+    version: RULE_VERSION,
+    sourceKey: snapshot.sourceKey,
+    exclude: snapshot.exclude,
+    metaFingerprint: snapshot.metaFingerprint,
+    docs,
+  }));
+}
+
+export async function prepareReadonlyRoot(
+  config: LoadedConfig,
+  root: LoadedRoot,
+  opts: { signal?: AbortSignal; now?: Date } = {},
+): Promise<PrepareOk | Fail> {
+  if (!config.ok) return { ok: false, error: config.error };
+  if (root.writable) return { ok: false, error: "记录目录不生成来源清洗资料" };
+  if (!root.exists || !root.realPath) return { ok: false, error: `root 目录不存在: ${root.name} (${root.path})` };
+
+  const b = newBudget(opts.signal);
+  const skipInside: string[] = [];
+  if (config.writable?.realPath) skipInside.push(config.writable.realPath);
+  const cacheDir = cacheDirFor(root.realPath);
+  skipInside.push(cacheDir);
+  await migrateLegacyCache(config.configPath, root.realPath);
+
+  const files: ScannedFile[] = [];
+  await walkFiles(root, skipInside, b, async (realPath, relPath) => {
+    const got = await readUtf8Limited(realPath, b);
+    if (!got) return;
+    files.push({
+      realPath,
+      relPath: relPath.replaceAll("\\", "/"),
+      dir: dirname(realPath),
+      name: basename(realPath),
+      text: got.text,
+      hash: sha256(got.buf),
+    });
+  });
+
+  const maps = await showDocMaps(files, root, b);
+  const docs: PreparedDoc[] = [];
+  for (const file of files) {
+    const key = pathKey(file.realPath);
+    if (maps.skipMeta.has(key)) continue;
+    const mappedTitle = maps.fileToTitle.get(key);
+    const title = (mappedTitle ?? extractNoteTitle(file.text) ?? basename(file.realPath, extname(file.realPath))).slice(0, TITLE_MAX);
+    const catalog = maps.titleToCatalog.get(title) ?? [];
+    docs.push({
+      path: file.realPath,
+      relPath: file.relPath,
+      title,
+      catalog,
+      sourceHash: file.hash,
+      lines: normalizeNoteLines(file.text),
+    });
+  }
+  docs.sort((a, b) => a.path.localeCompare(b.path));
+
+  const metaFingerprint = sha256(JSON.stringify({
+    titles: [...maps.fileToTitle.entries()].sort(),
+    catalogs: [...maps.titleToCatalog.entries()].sort(),
+    skipMeta: [...maps.skipMeta].sort(),
+  }));
+  const snapshot: PreparedSnapshot = {
+    version: RULE_VERSION,
+    sourceName: root.name,
+    sourcePath: root.realPath,
+    sourceKey: pathKey(root.realPath),
+    exclude: [...root.exclude],
+    metaFingerprint,
+    docs,
+    skipped: b.skipped,
+    skipReasons: b.reasons,
+    truncated: b.truncated,
+    preparedAt: (opts.now ?? new Date()).toISOString(),
+  };
+
+  const dest = sourceCachePath(root.realPath);
+  const previous = await readSnapshotFile(dest);
+  const prevFp = previous ? snapshotFingerprint(previous) : "";
+  const nextFp = snapshotFingerprint(snapshot);
+  if (previous && prevFp === nextFp && !snapshot.truncated) {
+    return {
+      ok: true,
+      snapshot: previous,
+      status: "reused",
+      path: dest,
+      processed: previous.docs.length,
+      updated: 0,
+    };
+  }
+
+  const prevHash = new Map((previous?.docs ?? []).map((d) => [pathKey(d.path), d.sourceHash]));
+  const updated = docs.filter((d) => prevHash.get(pathKey(d.path)) !== d.sourceHash).length;
+
+  let persistError: string | undefined;
+  let status: PrepareOk["status"] = previous ? "updated" : "created";
+  let path: string | undefined = dest;
+  if (snapshot.truncated) {
+    persistError = previous && !previous.truncated ? "扫描未完成，未覆盖完整快照" : "扫描未完成";
+    status = "memory_only";
+    path = undefined;
+  } else {
+    const published = await publishSnapshot(dest, snapshot);
+    if (!published.ok) {
+      persistError = published.error;
+      status = "memory_only";
+      path = undefined;
+    }
+  }
+
+  return {
+    ok: true,
+    snapshot,
+    status,
+    path,
+    processed: docs.length,
+    updated,
+    persistError,
+  };
 }

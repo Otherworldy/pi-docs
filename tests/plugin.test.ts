@@ -199,6 +199,26 @@ describe("pi extension", () => {
     assert.equal(res, undefined);
   });
 
+  it("generated cache is not a complete original read", async () => {
+    const { notes, handlers, ctx } = await setup();
+    const cache = join(notes, ".pi-kb");
+    const { readdir } = await import("node:fs/promises");
+    const files = await readdir(cache);
+    const snap = files.find((f) => f.endsWith(".json"));
+    assert.ok(snap);
+    const path = join(cache, snap!);
+    const id = "cache-read";
+    await handlers.tool_call({ toolName: "read", toolCallId: id, input: { path } }, ctx);
+    const res = await handlers.tool_result({
+      toolName: "read",
+      toolCallId: id,
+      isError: false,
+      content: [{ type: "text", text: await readFile(path, "utf8") }],
+      details: {},
+    }, ctx);
+    assert.equal(res, undefined);
+  });
+
   it("missing config does not crash tools", async () => {
     const { pi, handlers, tools, ctx } = mockPi();
     createKbExtension({ configPath: join(tmpdir(), "missing-pi-kb.json") })(pi as any);

@@ -35,15 +35,19 @@ pi install /home/Node/pi-docs
 
 `path` 必须是绝对路径或 `~/`（Windows 可用 `C:\\Notes` 或 `C:/Notes`）。最多一个 `writable: true`。`exclude` 为相对该 root 的路径前缀，按路径段匹配。修改配置后 `/reload`。
 
+可选 `enrich` 指定独立的低价清洗模型（`provider`、`model`，以及可选的 `maxOutputTokens`、`timeoutMs`）。改目录配置时会保留该字段。未配置时仍可只做规则清洗。
+
 Windows：路径比较忽略大小写和斜杠方向；目录联接按符号链接跳过，不跟随。写入先尝试硬链接，失败则用 `COPYFILE_EXCL` 独占拷贝，不会覆盖已有笔记。
 
 临时调试：`pi -e ./extensions/index.ts`
 
 ## 使用
 
-- `kb_search({ query, root?, limit? })`：短关键词。省略 `root` 时先搜 AI 笔记，没有可用结果再搜原文。指定只读 root 可强制搜原文。
+- `kb_search({ query, root?, limit? })`：短关键词。省略 `root` 时先搜 AI 笔记，没有可用结果再搜原文。指定只读 root 可强制搜原文。只读来源会先做规则清洗，标题/分类可参与匹配；若该版本已有语义整理，别名和常见问法也会参与，并标明“语义索引匹配”。
 - `kb_write({ title, body, readRef? })`：有 `readRef` 时保存该原文版本的资料整理；没有则保存问题经验。只新建文件，不改原笔记。
-- `/kb`：看来源。有终端 UI 时可添加、删除目录，并指定记录目录；结果写入 `pi-kb.json`。无 UI 时只刷新状态。
+- `/kb`：看来源。有终端 UI 时可添加、删除目录，指定记录目录，刷新规则资料，以及选择是否做 AI 全量语义整理。添加只读目录后会自动规则清洗，再询问是否调用清洗模型。无 UI：`/kb refresh` 刷新规则资料，`/kb enrich <root>` 启动/继续语义整理，`/kb pause <root>` 暂停。
+
+生成资料写在每个来源目录下的 `.pi-kb/`（`snapshot.json` / `sem.json` / `job.json`），扫描时会跳过该目录，不改原文。规则清洗完成后即可搜索；AI 整理按每次导入选择，失败或未启用不影响基础检索。生成资料不能当作完整阅读证据，`readRef` 仍只来自原文的完整 `read`。
 
 完整读过配置范围内的原文后，阅读结果会附带 `readRef`。讨论、规划、只读任务不要保存。
 
