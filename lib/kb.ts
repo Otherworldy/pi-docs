@@ -102,6 +102,7 @@ export {
 };
 
 export const CONFIG_FILENAME = "pi-kb.json";
+export const PLUGIN_OFF = "知识库插件已关闭。用 /kb 开启。";
 export const AUTHOR = "pi-agent";
 export const QUERY_MAX = 512;
 export const BODY_MAX = 16 * 1024;
@@ -171,6 +172,7 @@ export type EnrichSettings = {
 
 export type ConfigSpec = {
   isolation: boolean;
+  enabled: boolean;
   roots: RootInput[];
   projects: ProjectInput[];
   bindings: BindingInput[];
@@ -191,6 +193,7 @@ export type LoadedConfig = {
   ok: true;
   configPath: string;
   isolation: boolean;
+  enabled: boolean;
   roots: LoadedRoot[];
   projects: LoadedProject[];
   bindings: LoadedBinding[];
@@ -372,19 +375,24 @@ export function parseConfigJson(raw: unknown): ({ ok: true } & ConfigSpec) | Fai
       exclude: (root.exclude as string[] | undefined) ?? [],
     });
   }
+  if (rec.enabled !== undefined && typeof rec.enabled !== "boolean") {
+    return { ok: false, error: "enabled 必须是布尔值" };
+  }
+  const enabled = rec.enabled !== false;
   const enrich = parseEnrichSettings(rec.enrich);
   if (enrich && "ok" in enrich) return enrich;
   if (rec.version === undefined) {
     if (rec.projects !== undefined || rec.bindings !== undefined) {
       return { ok: false, error: "projects/bindings 需要 version: 2" };
     }
-    return { ok: true, isolation: false, roots: out, projects: [], bindings: [], enrich };
+    return { ok: true, isolation: false, enabled, roots: out, projects: [], bindings: [], enrich };
   }
   const iso = parseIsolationFields(rec, names);
   if (!iso.ok) return iso;
   return {
     ok: true,
     isolation: true,
+    enabled,
     roots: out,
     projects: iso.projects,
     bindings: iso.bindings,
@@ -465,6 +473,7 @@ export async function loadConfigFile(configPath: string, home = homedir()): Prom
     ok: true,
     configPath,
     isolation: spec.isolation,
+    enabled: spec.enabled,
     roots,
     projects,
     bindings: spec.bindings,
@@ -1077,6 +1086,7 @@ export async function searchKb(
   opts: { root?: string; limit?: number; signal?: AbortSignal; projectIds?: string[] } = {},
 ): Promise<SearchOk | Fail> {
   if (!config.ok) return { ok: false, error: config.error };
+  if (!config.enabled) return { ok: false, error: PLUGIN_OFF };
   const terms = tokenizeQuery(query);
   if (!Array.isArray(terms)) return terms;
   const limit = Math.min(MAX_LIMIT, Math.max(1, opts.limit ?? DEFAULT_LIMIT));
@@ -1293,6 +1303,30 @@ export function inQueryScope(
   });
 }
 
+function rootUsable(config: Extract<LoadedConfig, { ok: true }>, name: string): boolean {
+  const root = config.roots.find((r) => r.name === name);
+  return !!(root && (root.exists || root.writable));
+}
+
+export function hasProjectDocs(
+  config: LoadedConfig,
+  projectIds: string[] = [],
+  opts: { includeShared?: boolean } = {},
+): boolean {
+  if (!config.ok || !config.enabled) return false;
+  if (!config.isolation) return config.roots.some((r) => r.exists || r.writable);
+  if (opts.includeShared && config.bindings.some((b) => b.scope.kind === "shared" && rootUsable(config, b.root))) {
+    return true;
+  }
+  const ids = new Set(projectIds);
+  if (!ids.size) return false;
+  return config.bindings.some((b) => {
+    if (b.scope.kind !== "projects") return false;
+    if (!b.scope.projects.some((id) => ids.has(id))) return false;
+    return rootUsable(config, b.root);
+  });
+}
+
 export function scopeFingerprint(config: LoadedConfig, projectIds: string[] = []): string {
   if (!config.ok) return `err:${config.error}`;
   return JSON.stringify({
@@ -1309,6 +1343,7 @@ export async function writeLesson(
   input: { title: string; body: string; cwd: string; now?: Date; projectId?: string },
 ): Promise<WriteOk | Fail> {
   if (!config.ok) return { ok: false, error: config.error };
+  if (!config.enabled) return { ok: false, error: PLUGIN_OFF };
   if (!config.writable) return { ok: false, error: "未配置记录目录" };
   if (config.isolation && !input.projectId) return { ok: false, error: "未选择项目，无法记录经验" };
   const bad = validateTitleBody(input.title, input.body);
@@ -1347,6 +1382,7 @@ export async function writeDigest(
   input: { title: string; body: string; cwd: string; ref: ReadRef; now?: Date; projectIds?: string[] },
 ): Promise<WriteOk | Fail> {
   if (!config.ok) return { ok: false, error: config.error };
+  if (!config.enabled) return { ok: false, error: PLUGIN_OFF };
   if (!config.writable) return { ok: false, error: "未配置记录目录" };
   const bad = validateTitleBody(input.title, input.body);
   if (bad) return bad;
@@ -1402,7 +1438,12 @@ export async function formatStatus(config: LoadedConfig): Promise<string> {
     lines.push("策略: 未宣称知识库可用");
     return lines.join("\n");
   }
-  lines.push("策略: 联合检索原文与 AI 笔记；完整读原文后可整理；不改原笔记");
+  if (!config.enabled) {
+    lines.push("状态: 已关闭");
+    lines.push("策略: 不检索、不写入；用 /kb 开启");
+  } else {
+    lines.push("策略: 联合检索原文与 AI 笔记；完整读原文后可整理；不改原笔记");
+  }
   lines.push(config.isolation ? `项目隔离: ${config.projects.length} 个项目` : "项目隔离: 未启用");
   lines.push(`格式: ${[...TEXT_EXTS].join(" ")}`);
   if (config.enrich) lines.push(`清洗模型: ${config.enrich.provider}/${config.enrich.model}`);
@@ -1624,17 +1665,21 @@ export async function saveConfigFile(
   home = homedir(),
   enrich?: EnrichSettings | null,
   isolation?: { projects: ProjectInput[]; bindings: BindingInput[] } | null,
+  enabled?: boolean,
 ): Promise<LoadedConfig> {
   let nextEnrich = enrich;
   let nextIso = isolation;
-  if (nextEnrich === undefined || nextIso === undefined) {
+  let nextEnabled = enabled;
+  if (nextEnrich === undefined || nextIso === undefined || nextEnabled === undefined) {
     const existing = await loadConfigFile(configPath, home);
     if (existing.ok) {
       if (nextEnrich === undefined) nextEnrich = existing.enrich;
       if (nextIso === undefined) nextIso = snapshotIsolation(existing) ?? null;
+      if (nextEnabled === undefined) nextEnabled = existing.enabled;
     } else if (nextIso === undefined) {
       nextIso = null;
     }
+    if (nextEnabled === undefined) nextEnabled = true;
   }
   if (nextEnrich === null) nextEnrich = undefined;
   if (nextIso) {
@@ -1644,7 +1689,7 @@ export async function saveConfigFile(
       bindings: nextIso.bindings.filter((b) => names.has(b.root)),
     };
   }
-  const raw: Record<string, unknown> = { roots, enrich: nextEnrich };
+  const raw: Record<string, unknown> = { roots, enrich: nextEnrich, enabled: nextEnabled !== false };
   if (nextIso) {
     raw.version = CONFIG_VERSION;
     raw.projects = nextIso.projects;
@@ -1677,6 +1722,7 @@ export async function saveConfigFile(
     }));
   }
   if (spec.enrich) payload.enrich = spec.enrich;
+  if (spec.enabled === false) payload.enabled = false;
   const body = `${JSON.stringify(payload, null, 2)}\n`;
   await mkdir(dirname(configPath), { recursive: true });
   const tmpPath = join(dirname(configPath), `.pi-kb-${randomUUID()}.tmp`);
@@ -1927,6 +1973,19 @@ async function runKbMenu(
   }
 
   for (;;) {
+    if (config.ok && !config.enabled) {
+      const top = await ui.select("知识库", [
+        { value: "on", label: "开启插件", description: "恢复检索、整理和主动查阅" },
+      ]);
+      if (!top) {
+        ui.notify(await formatStatus(config));
+        return config;
+      }
+      const saved = await saveConfigFile(configPath, snapshotRoots(config), home, undefined, undefined, true);
+      config = saved;
+      ui.notify(saved.ok ? "已开启" : saved.error, saved.ok ? "info" : "error");
+      continue;
+    }
     const roots = snapshotRoots(config);
     const topOpts: KbSelectOption[] = roots.map((r) => ({
       value: `root:${r.name}`,
@@ -1934,10 +1993,17 @@ async function runKbMenu(
       description: r.writable ? `${r.path}  ·记录` : r.path,
     }));
     topOpts.push({ value: "add", label: "添加文档", description: "加入一个笔记目录，不改原文件" });
+    topOpts.push({ value: "off", label: "关闭插件", description: "停止检索和写入，目录配置保留" });
     const top = await ui.select("知识库", topOpts);
     if (!top) {
       ui.notify(await formatStatus(config));
       return config;
+    }
+    if (top === "off") {
+      const saved = await saveConfigFile(configPath, snapshotRoots(config), home, undefined, undefined, false);
+      config = saved;
+      ui.notify(saved.ok ? "已关闭" : saved.error, saved.ok ? "info" : "error");
+      continue;
     }
     if (top === "add") await addDoc();
     else if (top.startsWith("root:")) await docMenu(top.slice(5));

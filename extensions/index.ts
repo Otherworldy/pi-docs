@@ -20,6 +20,8 @@ import {
   isOriginalTextFile,
   isTruncatedReadResult,
   loadConfigFile,
+  saveConfigFile,
+  snapshotRoots,
   normalizeReadRef,
   pathKey,
   prepareReadonlyRoot,
@@ -27,6 +29,7 @@ import {
   sha256,
   sourceTitleFrom,
   inQueryScope,
+  hasProjectDocs,
   scopeFingerprint,
   writeDigest,
   writeLesson,
@@ -58,14 +61,10 @@ type PendingRead = {
   limit?: number;
 };
 
+const KB_TOOLS = ["kb_search", "kb_write"];
+
 function policy(config: LoadedConfig): string {
-  if (!config.ok) {
-    return [
-      "知识库插件已加载，但配置不可用。",
-      `原因: ${config.error}`,
-      "不要宣称已查阅笔记；不要调用 kb_write。可用 /kb 查看或配置目录。",
-    ].join("\n");
-  }
+  if (!config.ok || !config.enabled) return "";
   const names = config.roots.map((r) => `${r.name}${r.writable ? "(可写)" : "(只读)"}`).join("、");
   return [
     "本地知识库工具: kb_search、kb_write。可用 /kb 查看或配置来源。",
@@ -202,6 +201,25 @@ export function createKbExtension(opts: KbOptions = {}) {
     let projectId: string | undefined;
     let extraIds: string[] = [];
     let lastFp = "";
+    let lastCwd = process.cwd();
+
+    function offerKb(cwd: string): boolean {
+      return hasProjectDocs(config, searchIds(cwd), { includeShared: projectMode === "shared" });
+    }
+
+    function syncKbTools(cwd: string): boolean {
+      lastCwd = cwd;
+      const offer = offerKb(cwd);
+      if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return offer;
+      const active = pi.getActiveTools();
+      const next = offer
+        ? [...new Set([...active, ...KB_TOOLS])]
+        : active.filter((name) => !KB_TOOLS.includes(name));
+      if (next.length !== active.length || KB_TOOLS.some((name) => active.includes(name) !== next.includes(name))) {
+        pi.setActiveTools(next);
+      }
+      return offer;
+    }
 
     function projectIdsFor(cwd: string): string[] {
       if (!config.ok || !config.isolation) return [];
@@ -264,7 +282,7 @@ export function createKbExtension(opts: KbOptions = {}) {
     }
 
     async function indexAll(loaded: LoadedConfig, mode: "meta" | "full" = "meta") {
-      if (!loaded.ok) return;
+      if (!loaded.ok || !loaded.enabled) return;
       const rt = getRuntime();
       for (const root of loaded.roots.filter((r) => r.exists && r.realPath)) {
         try {
@@ -299,11 +317,13 @@ export function createKbExtension(opts: KbOptions = {}) {
       await reload();
       restoreSession(ctx ?? {});
       persistSession(pi, ctx?.cwd ?? process.cwd(), ctx?.ui);
+      syncKbTools(ctx?.cwd ?? process.cwd());
       void indexAll(config, "meta");
       if (indexTimer) clearInterval(indexTimer);
       indexTimer = setInterval(() => {
         void loadConfigFile(opts.configPath ?? join(getAgentDir(), CONFIG_FILENAME), home).then((loaded) => {
           config = loaded;
+          syncKbTools(lastCwd);
           return indexAll(loaded, "meta");
         });
       }, 60_000);
@@ -325,9 +345,14 @@ export function createKbExtension(opts: KbOptions = {}) {
       prompted.clear();
     });
 
-    pi.on("before_agent_start", (event) => ({
-      systemPrompt: `${event.systemPrompt}\n\n${policy(config)}`,
-    }));
+    pi.on("input", (_event, ctx) => {
+      syncKbTools(ctx?.cwd ?? lastCwd);
+    });
+
+    pi.on("before_agent_start", (event, ctx) => {
+      if (!syncKbTools(ctx?.cwd ?? lastCwd)) return;
+      return { systemPrompt: `${event.systemPrompt}\n\n${policy(config)}` };
+    });
 
     pi.registerTool({
       name: "kb_search",
@@ -411,6 +436,17 @@ export function createKbExtension(opts: KbOptions = {}) {
         const args = String(_args ?? "").trim();
         const hooks = enrichHooksFor(ctx, configPath, home, enrichRuns);
         const [cmd, rest] = args.split(/\s+/, 2);
+        if (cmd === "off" || cmd === "on") {
+          config = await loadConfigFile(configPath, home);
+          config = await saveConfigFile(configPath, snapshotRoots(config), home, undefined, undefined, cmd === "on");
+          if (config.ok && !config.enabled) {
+            for (const root of config.roots) await hooks.pause?.(root.name);
+            for (const run of enrichRuns.values()) run.ac.abort();
+          }
+          ctx.ui?.notify?.(config.ok ? (config.enabled ? "已开启" : "已关闭") : config.error, config.ok ? "info" : "error");
+          syncKbTools(ctx.cwd ?? process.cwd());
+          return;
+        }
         if (cmd === "project" || cmd === "scope") {
           config = await loadConfigFile(configPath, home);
           if (cmd === "project") {
@@ -432,11 +468,13 @@ export function createKbExtension(opts: KbOptions = {}) {
           }
           persistSession(pi, ctx.cwd ?? process.cwd(), ctx.ui);
           bumpScope(ctx.cwd ?? process.cwd());
+          syncKbTools(ctx.cwd ?? process.cwd());
           return;
         }
         if (!ctx.hasUI) {
           config = await loadConfigFile(configPath, home);
           if (!config.ok) return;
+          if (!config.enabled) return;
           const name = rest;
           if (!cmd || cmd === "refresh") {
             for (const root of config.roots.filter((r) => r.exists && (!name || r.name === name))) {
@@ -465,8 +503,14 @@ export function createKbExtension(opts: KbOptions = {}) {
             extraIds = next.extraIds;
             persistSession(pi, ctx.cwd ?? process.cwd(), ctx.ui);
             bumpScope(ctx.cwd ?? process.cwd());
+            syncKbTools(ctx.cwd ?? process.cwd());
           },
         });
+        if (config.ok && !config.enabled) {
+          for (const root of config.roots) await hooks.pause?.(root.name);
+          for (const run of enrichRuns.values()) run.ac.abort();
+        }
+        syncKbTools(ctx.cwd ?? process.cwd());
       },
     });
 
@@ -485,7 +529,7 @@ export function createKbExtension(opts: KbOptions = {}) {
     }
 
     pi.on("tool_call", async (event, ctx) => {
-      if (!isToolCallEventType("read", event) || !config.ok) return;
+      if (!isToolCallEventType("read", event) || !config.ok || !config.enabled) return;
       const input = event.input as { path?: string; offset?: number; limit?: number };
       if (!input.path) return;
       const abs = isAbsolute(input.path) ? input.path : join(ctx.cwd, input.path);
@@ -514,7 +558,7 @@ export function createKbExtension(opts: KbOptions = {}) {
     pi.on("tool_result", async (event, ctx) => {
       const snap = pending.get(event.toolCallId);
       pending.delete(event.toolCallId);
-      if (!snap || !config.ok) return;
+      if (!snap || !config.ok || !config.enabled) return;
       if (event.isError) return;
       const cwd = ctx?.cwd ?? process.cwd();
       bumpScope(cwd);

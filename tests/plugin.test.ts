@@ -23,6 +23,7 @@ function mockPi() {
   const tools: Record<string, any> = {};
   const commands: Record<string, any> = {};
   const notifies: string[] = [];
+  const active = ["read", "bash", "kb_search", "kb_write"];
   const pi = {
     on(name: string, fn: Handler) {
       handlers[name] = fn;
@@ -33,13 +34,19 @@ function mockPi() {
     registerCommand(name: string, def: any) {
       commands[name] = def;
     },
+    getActiveTools() {
+      return [...active];
+    },
+    setActiveTools(names: string[]) {
+      active.splice(0, active.length, ...names);
+    },
   };
   const ctx = {
     cwd: "/proj",
     hasUI: true,
     ui: { notify: (t: string) => notifies.push(t) },
   };
-  return { pi, handlers, tools, commands, ctx, notifies };
+  return { pi, handlers, tools, commands, ctx, notifies, active };
 }
 
 async function setup() {
@@ -160,6 +167,47 @@ describe("pi extension", () => {
       readRef,
     }, undefined, undefined, ctx);
     assert.equal(afterReload.isError, true);
+  });
+
+  it("hides kb tools when the current project has no document directory", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-kb-ext-nodoc-"));
+    const notes = join(dir, "notes");
+    const code = join(dir, "code");
+    await mkdir(notes);
+    await mkdir(code);
+    const configPath = join(dir, "pi-kb.json");
+    await writeFile(configPath, JSON.stringify({
+      version: 2,
+      roots: [{ name: "notes", path: notes }],
+      projects: [{ id: "pa", name: "A", workspaces: [code] }],
+      bindings: [{ root: "notes", path: ".", scope: { projects: ["pa"] } }],
+    }));
+    const { pi, handlers, ctx, active } = mockPi();
+    ctx.cwd = join(dir, "elsewhere");
+    createKbExtension({ configPath })(pi as any);
+    await handlers.session_start({}, ctx);
+    assert.equal(active.includes("kb_search"), false);
+    assert.equal(active.includes("kb_write"), false);
+    const prompt = await handlers.before_agent_start({ systemPrompt: "BASE", prompt: "hi" }, ctx);
+    assert.equal(prompt, undefined);
+    ctx.cwd = code;
+    await handlers.session_start({}, ctx);
+    assert.equal(active.includes("kb_search"), true);
+    const on = await handlers.before_agent_start({ systemPrompt: "BASE", prompt: "hi" }, ctx);
+    assert.match(on.systemPrompt, /kb_search/);
+  });
+
+  it("disabled plugin refuses search and omits lookup policy", async () => {
+    const { dir, tools, handlers, ctx } = await setup();
+    const raw = JSON.parse(await readFile(join(dir, "pi-kb.json"), "utf8"));
+    raw.enabled = false;
+    await writeFile(join(dir, "pi-kb.json"), JSON.stringify(raw));
+    await handlers.session_start({}, ctx);
+    const prompt = await handlers.before_agent_start({ systemPrompt: "BASE", prompt: "hi" }, ctx);
+    assert.equal(prompt, undefined);
+    const found = await tools.kb_search.execute("1", { query: "headerField" }, undefined, undefined, ctx);
+    assert.equal(found.isError, true);
+    assert.match(found.content[0].text, /已关闭/);
   });
 
   it("kb_write keeps readRef after config reload changes the scope fingerprint", async () => {

@@ -21,6 +21,7 @@ import {
   pathKey,
   prepareReadonlyRoot,
   saveConfigFile,
+  hasProjectDocs,
   searchKb,
   sha256,
   sourceCachePath,
@@ -151,6 +152,101 @@ describe("config", () => {
     if (!added.ok) return;
     assert.equal(added.enrich?.provider, "openai");
     assert.equal(parseConfigJson({ roots: [{ name: "n", path: "/x" }] }).ok, true);
+    const off = parseConfigJson({ roots: [{ name: "n", path: "/x" }], enabled: false });
+    assert.equal(off.ok, true);
+    if (!off.ok) return;
+    assert.equal(off.enabled, false);
+    assert.equal(parseConfigJson({ roots: [{ name: "n", path: "/x" }], enabled: "no" }).ok, false);
+  });
+
+  it("plugin switch persists, blocks search, and restores", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await mkdir(notes);
+    await write(join(notes, "a.md"), "hello-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    const saved = await saveConfigFile(configPath, [{ name: "notes", path: notes }]);
+    assert.equal(saved.ok, true);
+    if (!saved.ok) return;
+    assert.equal(saved.enabled, true);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).enabled, undefined);
+
+    let openMenu: string[] | undefined;
+    let closedMenu: string[] | undefined;
+    const selects = ["off"];
+    const closed = await configureKbInteractive(configPath, {
+      select: async (_title: string, options?: KbSelectOption[]) => {
+        const v = vals(options);
+        if (v.includes("off")) openMenu = v;
+        if (v.includes("on") && !v.includes("off")) closedMenu = v;
+        return selects.shift();
+      },
+      input: async () => undefined,
+      confirm: async () => false,
+      notify() {},
+    });
+    assert.equal(closed.ok, true);
+    if (!closed.ok) return;
+    assert.equal(closed.enabled, false);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).enabled, false);
+    assert.ok(openMenu?.includes("add"));
+    assert.ok(openMenu?.includes("off"));
+    assert.deepEqual(closedMenu, ["on"]);
+    const blocked = await searchKb(closed, "hello-token");
+    assert.equal(blocked.ok, false);
+    assert.match(await formatStatus(closed), /已关闭/);
+
+    const selectsOn = ["on"];
+    const opened = await configureKbInteractive(configPath, {
+      select: async () => selectsOn.shift(),
+      input: async () => undefined,
+      confirm: async () => false,
+      notify() {},
+    });
+    assert.equal(opened.ok, true);
+    if (!opened.ok) return;
+    assert.equal(opened.enabled, true);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).enabled, undefined);
+    const hit = await searchKb(opened, "hello-token");
+    assert.equal(hit.ok, true);
+    if (!hit.ok) return;
+    assert.equal(hit.hits.length, 1);
+  });
+
+  it("hasProjectDocs follows isolation bindings, not shared-only", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    const code = join(dir, "code");
+    await mkdir(notes);
+    await mkdir(code);
+    const configPath = join(dir, "pi-kb.json");
+    const saved = await saveConfigFile(configPath, [{ name: "notes", path: notes }], undefined, undefined, {
+      projects: [
+        { id: "pa", name: "A", workspaces: [code] },
+        { id: "pb", name: "B", workspaces: [join(dir, "other")] },
+      ],
+      bindings: [{ root: "notes", path: ".", scope: { kind: "projects", projects: ["pa"] } }],
+    });
+    assert.equal(saved.ok, true);
+    if (!saved.ok) return;
+    assert.equal(hasProjectDocs(saved, ["pa"]), true);
+    assert.equal(hasProjectDocs(saved, ["pb"]), false);
+    assert.equal(hasProjectDocs(saved, []), false);
+    assert.equal(hasProjectDocs(saved, [], { includeShared: true }), false);
+    const shared = await saveConfigFile(configPath, [{ name: "notes", path: notes }], undefined, undefined, {
+      projects: [{ id: "pa", name: "A", workspaces: [code] }],
+      bindings: [{ root: "notes", path: ".", scope: { kind: "shared" } }],
+    });
+    assert.equal(shared.ok, true);
+    if (!shared.ok) return;
+    assert.equal(hasProjectDocs(shared, ["pa"]), false);
+    assert.equal(hasProjectDocs(shared, [], { includeShared: true }), true);
+    const legacy = await cfg(dir, [{ name: "notes", path: notes }]);
+    assert.equal(legacy.ok, true);
+    if (!legacy.ok) return;
+    assert.equal(hasProjectDocs(legacy, []), true);
+    const off = { ...saved, enabled: false };
+    assert.equal(hasProjectDocs(off, ["pa"]), false);
   });
 
   it("saveConfigFile round-trips and interactive add creates config", async () => {
