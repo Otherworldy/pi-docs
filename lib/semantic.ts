@@ -380,7 +380,7 @@ function mergeRecord(doc: PreparedDoc, enrich: EnrichSettings, parts: ReturnType
 
 function reuseChunks(prev: EnrichJob | undefined, next: EnrichJob): EnrichJob {
   if (!prev) return next;
-  if (prev.provider !== next.provider || prev.model !== next.model || prev.promptVersion !== next.promptVersion) return next;
+  if (prev.promptVersion !== next.promptVersion) return next;
   const done = new Map(prev.chunks.filter((c) => c.status === "completed").map((c) => [chunkKey(c), c]));
   const records = prev.records.filter((r) => next.chunks.some((c) => pathKey(c.docPath) === pathKey(r.path) && c.sourceHash === r.sourceHash));
   return {

@@ -199,6 +199,41 @@ describe("semantic", () => {
     assert.match(paused, /部分完成|请求/);
   });
 
+  it("incremental keeps completed chunks after the cleaning model changes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-kb-sem-model-"));
+    const notes = join(dir, "notes");
+    await write(join(notes, "a.md"), "alpha-token\n");
+    await write(join(notes, "b.md"), "beta-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    await writeFile(configPath, JSON.stringify({ roots: [{ name: "notes", path: notes }], enrich }));
+    const loaded = await loadConfigFile(configPath);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    let calls = 0;
+    const complete: ModelComplete = async ({ user }) => {
+      calls += 1;
+      const token = user.includes("beta-token") ? "beta-token" : "alpha-token";
+      return {
+        text: JSON.stringify({
+          summary: token,
+          topics: [token],
+          aliases: [],
+          questions: [],
+          rules: [{ text: token, startLine: 1, endLine: 1, excerpt: token }],
+        }),
+        inputTokens: 1,
+        outputTokens: 1,
+      };
+    };
+    await startEnrichment(loaded, "notes", complete);
+    assert.equal(calls, 2);
+    const switched = { ...loaded, enrich: { ...enrich, model: "other" } };
+    await startEnrichment(switched, "notes", complete, { mode: "incremental" });
+    assert.equal(calls, 2);
+    await startEnrichment(switched, "notes", complete, { mode: "full" });
+    assert.equal(calls, 4);
+  });
+
   it("enriches a writable vault", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-kb-semw-"));
     const notes = join(dir, "notes");
