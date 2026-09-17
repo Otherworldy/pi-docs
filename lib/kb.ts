@@ -690,7 +690,7 @@ async function validateDigest(
   if (!owner || coveredAndExcluded(sourceReal, config.roots)) {
     return { usable: false, meta, sourceStatus: "out-of-scope" };
   }
-  if (config.writable?.realPath && pathInside(sourceReal, config.writable.realPath)) {
+  if (isAiOutputFile(config, sourceReal)) {
     return { usable: false, meta, sourceStatus: "out-of-scope" };
   }
   const got = await readUtf8Limited(sourceReal, b);
@@ -703,6 +703,12 @@ async function validateDigest(
 function isAiNoteRel(relPath: string): boolean {
   const rel = relPath.replaceAll("\\", "/");
   return rel === "digests" || rel === "lessons" || rel.startsWith("digests/") || rel.startsWith("lessons/");
+}
+
+function isAiOutputFile(config: Extract<LoadedConfig, { ok: true }>, realPath: string): boolean {
+  const w = config.writable?.realPath;
+  if (!w || !pathInside(realPath, w)) return false;
+  return isAiNoteRel(relative(w, realPath));
 }
 
 async function searchLayer(
@@ -1356,7 +1362,7 @@ export async function writeDigest(
   if (config.isolation && !inQueryScope(config, sourceReal, input.projectIds ?? [])) {
     return { ok: false, error: "来源不在当前允许范围内" };
   }
-  if (config.writable.realPath && pathInside(sourceReal, config.writable.realPath)) {
+  if (isAiOutputFile(config, sourceReal)) {
     return { ok: false, error: "不能把 AI 笔记再整理成资料整理" };
   }
   const buf = await readFile(sourceReal);
@@ -1437,7 +1443,7 @@ async function loadJobSummaries(config: Extract<LoadedConfig, { ok: true }>): Pr
 export type RootChange =
   | { op: "add"; name: string; path: string; writable?: boolean }
   | { op: "remove"; name: string }
-  | { op: "setWritable"; name: string };
+  | { op: "setWritable"; name: string; writable?: boolean };
 
 export type KbSelectOption = string | { value: string; label?: string; description?: string };
 
@@ -1604,7 +1610,8 @@ export function applyRootChange(roots: RootInput[], change: RootChange): { ok: t
   } else {
     const t = next.find((r) => r.name === change.name);
     if (!t) return { ok: false, error: `没有这个目录: ${change.name}` };
-    for (const r of next) r.writable = r.name === change.name;
+    if (change.writable === false) t.writable = false;
+    else for (const r of next) r.writable = r.name === change.name;
   }
   const parsed = parseConfigJson({ roots: next });
   if (!parsed.ok) return parsed;
@@ -1741,12 +1748,13 @@ async function runKbMenu(
     if (!name) return;
     const path = (await ui.input("路径"))?.trim();
     if (!path) return;
-    const roots = snapshotRoots(config);
-    let writable = false;
-    if (!roots.some((r) => r.writable)) {
-      writable = await ui.confirm("作为记录目录？", "kb_write 会写入此目录下的 digests/ 和 lessons/");
-    }
-    const applied = applyRootChange(roots, { op: "add", name, path, writable });
+    const kind = await ui.select("用途", [
+      { value: "readonly", label: "只读资料", description: "检索原文，不在此写入" },
+      { value: "writable", label: "记录目录", description: "原文可读可检索；kb_write 写入 digests/ 和 lessons/，同时只能有一个" },
+    ]);
+    if (!kind) return;
+    const writable = kind === "writable";
+    const applied = applyRootChange(snapshotRoots(config), { op: "add", name, path, writable });
     if (!applied.ok) {
       ui.notify(applied.error, "error");
       return;
@@ -1875,6 +1883,9 @@ async function runKbMenu(
         { value: "delete", label: "删除", description: "只去掉配置，不删磁盘文件" },
         { value: "ai", label: "AI整理", description: "用清洗模型生成检索资料" },
         { value: "scope", label: "归属", description: "这份资料给哪些项目用" },
+        root.writable
+          ? { value: "readonly", label: "取消记录", description: "改回只读资料，不再接收 kb_write" }
+          : { value: "writable", label: "设为记录目录", description: "原文仍可读；kb_write 写入 digests/ 和 lessons/，同时只能有一个" },
       ]);
       if (!act) return;
       if (act === "ai") {
@@ -1883,6 +1894,21 @@ async function runKbMenu(
       }
       if (act === "scope") {
         await scopeMenu(rootName);
+        continue;
+      }
+      if (act === "writable" || act === "readonly") {
+        const applied = applyRootChange(snapshotRoots(config), {
+          op: "setWritable",
+          name: rootName,
+          writable: act === "writable",
+        });
+        if (!applied.ok) {
+          ui.notify(applied.error, "error");
+          continue;
+        }
+        const saved = await saveConfigFile(configPath, applied.roots, home);
+        config = saved;
+        ui.notify(saved.ok ? (act === "writable" ? "已设为记录目录" : "已改为只读") : saved.error, saved.ok ? "info" : "error");
         continue;
       }
       if (act === "delete") {
@@ -1940,7 +1966,7 @@ export function isOriginalTextFile(config: Extract<LoadedConfig, { ok: true }>, 
   if (!TEXT_EXTS.has(extname(realPath).toLowerCase())) return false;
   const owner = mostSpecificRoot(realPath, config.roots);
   if (owner && pathInside(realPath, cacheDirFor(owner.realPath ?? owner.path))) return false;
-  if (config.writable?.realPath && pathInside(realPath, config.writable.realPath)) return false;
+  if (isAiOutputFile(config, realPath)) return false;
   if (!owner) return false;
   if (coveredAndExcluded(realPath, config.roots)) return false;
   return true;

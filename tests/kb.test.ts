@@ -24,6 +24,7 @@ import {
   searchKb,
   sha256,
   sourceCachePath,
+  isOriginalTextFile,
   writeDigest,
   writeLesson,
   type LoadedConfig,
@@ -126,6 +127,10 @@ describe("config", () => {
     assert.equal(removed.roots.length, 1);
     const rel = applyRootChange([], { op: "add", name: "x", path: "rel" });
     assert.equal(rel.ok, false);
+    const cleared = applyRootChange(second.roots, { op: "setWritable", name: "agent", writable: false });
+    assert.equal(cleared.ok, true);
+    if (!cleared.ok) return;
+    assert.equal(cleared.roots.every((r) => !r.writable), true);
   });
 
   it("enrich settings round-trip and survive root edits", async () => {
@@ -160,7 +165,7 @@ describe("config", () => {
 
     const other = join(dir, "other");
     await mkdir(other);
-    const selects = ["add"];
+    const selects = ["add", "readonly"];
     const inputs = ["docs", other];
     const ui = {
       select: async () => selects.shift(),
@@ -183,7 +188,7 @@ describe("config", () => {
     await write(join(notes, "a.md"), "hello-token\n");
     const configPath = join(dir, "pi-kb.json");
     let started = 0;
-    const selects = ["add"];
+    const selects = ["add", "readonly"];
     const inputs = ["notes", notes];
     const ui = {
       select: async () => selects.shift(),
@@ -214,7 +219,7 @@ describe("config", () => {
     const notes = join(dir, "notes");
     await mkdir(notes);
     const configPath = join(dir, "pi-kb.json");
-    const selects = ["add"];
+    const selects = ["add", "readonly"];
     const inputs = ["notes", notes];
     const placeholders: (string | undefined)[] = [];
     const loaded = await configureKbInteractive(configPath, {
@@ -240,9 +245,8 @@ describe("config", () => {
     await mkdir(notes);
     await write(join(notes, "a.md"), "vault-token\n");
     const configPath = join(dir, "pi-kb.json");
-    const confirms = [true, false];
     let menu: string[] | undefined;
-    const selects = ["add"];
+    const selects = ["add", "writable"];
     const inputs = ["notes", notes];
     const ui = {
       select: async (_title: string, options?: KbSelectOption[]) => {
@@ -250,7 +254,7 @@ describe("config", () => {
         return selects.shift();
       },
       input: async () => inputs.shift(),
-      confirm: async () => confirms.shift() ?? false,
+      confirm: async () => false,
       notify() {},
     };
     const loaded = await configureKbInteractive(configPath, ui);
@@ -744,6 +748,35 @@ describe("prepare", () => {
     assert.equal(digest.ok, true);
     if (!digest.ok) return;
     assert.ok(digest.hits.some((h) => h.kind === "lesson" && h.path.includes("digests")));
+  });
+
+  it("writable vault originals issue digest; AI notes do not", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    const src = join(notes, "a.md");
+    await write(src, "headerField 默认 person\n");
+    const loaded = await cfg(dir, [{ name: "notes", path: notes, writable: true }]);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const real = await realpath(src);
+    assert.equal(isOriginalTextFile(loaded, real), true);
+    const buf = await readFile(real);
+    const w = await writeDigest(loaded, {
+      title: "a",
+      body: "默认 headerField 是 person。",
+      cwd: dir,
+      ref: { id: "r1", sourcePath: real, sourceHash: sha256(buf), sourceTitle: "a" },
+    });
+    assert.equal(w.ok, true);
+    if (!w.ok) return;
+    assert.equal(isOriginalTextFile(loaded, w.path), false);
+    const again = await writeDigest(loaded, {
+      title: "no",
+      body: "不能整理 AI 笔记",
+      cwd: dir,
+      ref: { id: "r2", sourcePath: w.path, sourceHash: sha256(await readFile(w.path)), sourceTitle: "digest" },
+    });
+    assert.equal(again.ok, false);
   });
 });
 
