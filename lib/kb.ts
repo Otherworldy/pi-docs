@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import {
   constants,
@@ -25,29 +25,82 @@ import {
   extname,
   isAbsolute,
   join,
-  posix,
   relative,
   resolve,
-  win32,
 } from "node:path";
+import {
+  CACHE_DIRNAME,
+  FILE_MAX,
+  SKIP_DIRS,
+  TEXT_EXTS,
+  TITLE_MAX,
+  asLines,
+  cacheDirFor,
+  decodeEntities,
+  digestFileName,
+  excluded,
+  extractNoteTitle,
+  foldSpace,
+  normalizeNoteLines,
+  parseShowDocInfo,
+  parseShowDocReadme,
+  pathInside,
+  pathKey,
+  samePath,
+  sha256,
+  sourceCachePath,
+  sourceTitleFrom,
+  stripBom,
+} from "./source.mjs";
+import {
+  budgetStop as collectBudgetStop,
+  indexRoot,
+  newScanBudget,
+  readUtf8Limited,
+  skipInsidePaths,
+  skipScan,
+  walkTextFiles,
+} from "./collect.mjs";
+import { readGeneration, readTopManifest } from "./index-store.mjs";
+import { searchRootIndex } from "./retrieval.mjs";
+
+export {
+  CACHE_DIRNAME,
+  FILE_MAX,
+  SKIP_DIRS,
+  TEXT_EXTS,
+  TITLE_MAX,
+  asLines,
+  cacheDirFor,
+  decodeEntities,
+  digestFileName,
+  excluded,
+  extractNoteTitle,
+  foldSpace,
+  normalizeNoteLines,
+  parseShowDocInfo,
+  parseShowDocReadme,
+  pathInside,
+  pathKey,
+  samePath,
+  sha256,
+  sourceCachePath,
+  sourceTitleFrom,
+  stripBom,
+};
 
 export const CONFIG_FILENAME = "pi-kb.json";
 export const AUTHOR = "pi-agent";
-export const TEXT_EXTS = new Set([".md", ".mdx", ".txt", ".html", ".htm", ".json", ".yaml", ".yml"]);
-export const SKIP_DIRS = new Set([".git", ".obsidian", "node_modules", ".pi-kb", "pi-kb-cache"]);
 export const QUERY_MAX = 512;
-export const TITLE_MAX = 120;
 export const BODY_MAX = 16 * 1024;
 export const SNIPPET_MAX = 300;
 export const DEFAULT_LIMIT = 8;
 export const MAX_LIMIT = 20;
 export const OUTPUT_MAX = 12 * 1024;
-export const FILE_MAX = 1024 * 1024;
 export const MAX_DIRENTS = 10_000;
 export const MAX_BODY_BYTES = 32 * 1024 * 1024;
 export const SCAN_MS = 5000;
 export const RULE_VERSION = 1;
-export const CACHE_DIRNAME = ".pi-kb";
 export const LEGACY_CACHE_DIRNAME = "pi-kb-cache";
 export const SNAPSHOT_MAX = 32 * 1024 * 1024;
 
@@ -100,7 +153,7 @@ export type ReadRef = {
 export type Snippet = { line: number; text: string };
 
 export type SearchHit = {
-  kind: "digest" | "lesson" | "original";
+  kind: "digest" | "lesson" | "original" | "derived";
   root: string;
   path: string;
   relPath: string;
@@ -114,6 +167,7 @@ export type SearchHit = {
   pathScore: number;
   semanticMatch?: boolean;
   semanticEvidence?: string;
+  partial?: boolean;
 };
 
 export type SearchOk = {
@@ -178,18 +232,6 @@ export type Budget = {
   signal?: AbortSignal;
 };
 
-const NAMED_ENTITIES: Record<string, string> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-  nbsp: " ",
-};
-
-export function sha256(data: string | Buffer): string {
-  return createHash("sha256").update(data).digest("hex");
-}
 
 export function isTruncatedReadResult(details: unknown, text: string, offset?: number): boolean {
   const tr = details && typeof details === "object"
@@ -211,58 +253,6 @@ export function expandUserPath(p: string, home = homedir()): string {
   if (p === "~") return home;
   if (p.startsWith("~/")) return join(home, p.slice(2));
   return p;
-}
-
-function pathApi(platform = process.platform) {
-  return platform === "win32" ? win32 : posix;
-}
-
-/** Stable path identity: Windows is case-insensitive and slash-insensitive. */
-export function pathKey(p: string, platform = process.platform): string {
-  const n = pathApi(platform).normalize(p);
-  return platform === "win32" ? n.toLowerCase() : n;
-}
-
-export function samePath(a: string, b: string, platform = process.platform): boolean {
-  return pathKey(a, platform) === pathKey(b, platform);
-}
-
-export function pathInside(child: string, parent: string, platform = process.platform): boolean {
-  const api = pathApi(platform);
-  const c = api.resolve(child);
-  const p = api.resolve(parent);
-  const rel = api.relative(p, c);
-  return rel === "" || (!rel.startsWith(`..${api.sep}`) && rel !== ".." && !api.isAbsolute(rel));
-}
-
-export function excluded(relPath: string, rules: string[]): boolean {
-  const norm = relPath.replaceAll("\\", "/").replace(/^\/+/, "");
-  for (const rule of rules) {
-    const r = rule.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
-    if (!r) continue;
-    if (norm === r || norm.startsWith(`${r}/`)) return true;
-  }
-  return false;
-}
-
-export function decodeEntities(text: string): string {
-  return text.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos|nbsp);/g, (whole, ent: string) => {
-    const named = NAMED_ENTITIES[ent];
-    if (named !== undefined) return named;
-    let n: number;
-    if (ent.startsWith("#x") || ent.startsWith("#X")) n = Number.parseInt(ent.slice(2), 16);
-    else n = Number.parseInt(ent.slice(1), 10);
-    if (!Number.isFinite(n) || n < 0 || n > 0x10ffff) return whole;
-    try {
-      return String.fromCodePoint(n);
-    } catch {
-      return whole;
-    }
-  });
-}
-
-export function foldSpace(text: string): string {
-  return text.replace(/[ \t]+/g, " ");
 }
 
 export function parseEnrichSettings(raw: unknown): EnrichSettings | Fail | undefined {
@@ -462,10 +452,6 @@ export function formatNote(meta: Record<string, unknown>, title: string, body: s
   return `<!-- pi-kb\n${JSON.stringify(meta)}\n-->\n\n# ${title}\n\n${body.trim()}\n`;
 }
 
-export function digestFileName(sourcePath: string, sourceHash: string, platform = process.platform): string {
-  return `${sha256(pathKey(sourcePath, platform))}-${sourceHash}.md`;
-}
-
 export function findSecretKind(text: string): string | null {
   if (/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(text)) return "private-key";
   if (/\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/.test(text)) return "github-token";
@@ -483,47 +469,15 @@ export function findSecretKind(text: string): string | null {
 }
 
 function newBudget(signal?: AbortSignal, now = Date.now()): Budget {
-  return {
-    deadline: now + SCAN_MS,
-    dirents: 0,
-    bodyBytes: 0,
-    skipped: 0,
-    reasons: [],
-    truncated: false,
-    signal,
-  };
+  return newScanBudget(signal, now) as Budget;
 }
 
-function budgetStop(b: Budget, reason: string): boolean {
-  if (b.signal?.aborted) {
-    b.truncated = true;
-    b.reasons.push("cancelled");
-    return true;
-  }
-  if (Date.now() > b.deadline) {
-    b.truncated = true;
-    b.reasons.push("time");
-    return true;
-  }
-  if (b.dirents >= MAX_DIRENTS) {
-    b.truncated = true;
-    b.reasons.push("dirents");
-    return true;
-  }
-  if (b.bodyBytes >= MAX_BODY_BYTES) {
-    b.truncated = true;
-    b.reasons.push("body-bytes");
-    return true;
-  }
-  if (reason) {
-    /* used by callers via skip */
-  }
-  return false;
+function budgetStop(b: Budget, _reason = ""): boolean {
+  return collectBudgetStop(b);
 }
 
 function skip(b: Budget, reason: string): void {
-  b.skipped += 1;
-  if (b.reasons.length < 8 && !b.reasons.includes(reason)) b.reasons.push(reason);
+  skipScan(b, reason);
 }
 
 export async function ensureWritableDir(root: LoadedRoot): Promise<string> {
@@ -556,122 +510,10 @@ async function walkFiles(
   b: Budget,
   visit: (realPath: string, relPath: string) => Promise<void>,
 ): Promise<void> {
-  const base = root.realPath;
-  if (!base) return;
-  const stack = [base];
-  while (stack.length) {
-    if (budgetStop(b, "")) return;
-    const dir = stack.pop()!;
-    let entries: Dirent[];
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      skip(b, "unreadable-dir");
-      continue;
-    }
-    for (const ent of entries) {
-      b.dirents += 1;
-      if (budgetStop(b, "")) return;
-      const abs = join(dir, ent.name);
-      let st;
-      try {
-        st = await lstat(abs);
-      } catch {
-        skip(b, "unreadable-file");
-        continue;
-      }
-      if (st.isSymbolicLink()) {
-        skip(b, "symlink");
-        continue;
-      }
-      if (st.isDirectory()) {
-        if (SKIP_DIRS.has(ent.name)) continue;
-        if (skipInside.some((p) => pathInside(abs, p) || samePath(abs, p))) continue;
-        stack.push(abs);
-        continue;
-      }
-      if (!st.isFile()) continue;
-      if (!TEXT_EXTS.has(extname(ent.name).toLowerCase())) continue;
-      let real: string;
-      try {
-        real = await realpath(abs);
-      } catch {
-        skip(b, "unreadable-file");
-        continue;
-      }
-      if (skipInside.some((p) => pathInside(real, p) || samePath(real, p))) continue;
-      if (coveredAndExcluded(real, [root])) continue;
-      const rel = relative(base, real);
-      await visit(real, rel);
-    }
-  }
+  if (!root.realPath) return;
+  await walkTextFiles(root.realPath, skipInside, b, (realPath, relPath) => visit(realPath, relPath), root.exclude);
 }
 
-async function readUtf8Limited(path: string, b: Budget): Promise<{ text: string; buf: Buffer } | null> {
-  let st;
-  try {
-    st = await lstat(path);
-  } catch {
-    skip(b, "unreadable-file");
-    return null;
-  }
-  if (!st.isFile() || st.isSymbolicLink()) {
-    skip(b, "symlink");
-    return null;
-  }
-  if (st.size > FILE_MAX) {
-    skip(b, "too-large");
-    return null;
-  }
-  let buf: Buffer;
-  try {
-    buf = await readFile(path);
-  } catch {
-    skip(b, "unreadable-file");
-    return null;
-  }
-  b.bodyBytes += buf.byteLength;
-  if (buf.includes(0)) {
-    skip(b, "binary");
-    return null;
-  }
-  const text = buf.toString("utf8");
-  if (!Buffer.from(text, "utf8").equals(buf)) {
-    skip(b, "non-utf8");
-    return null;
-  }
-  return { text, buf };
-}
-
-export function asLines(text: string): string[] {
-  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-}
-
-export function stripBom(text: string): string {
-  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-}
-
-export function normalizeNoteLines(text: string): string[] {
-  return asLines(stripBom(text)).map((line) => decodeEntities(line));
-}
-
-export function extractNoteTitle(text: string): string | undefined {
-  const lines = asLines(stripBom(text));
-  let fence: string | undefined;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    const mark = /^(```+|~~~+)/.exec(trimmed);
-    if (mark) {
-      const ch = mark[1][0];
-      if (!fence) fence = ch;
-      else if (ch === fence) fence = undefined;
-      continue;
-    }
-    if (fence) continue;
-    const heading = /^(#{1,6})\s+(\S.*)$/.exec(trimmed);
-    if (heading) return heading[2].trim().slice(0, TITLE_MAX);
-  }
-}
 
 function matchFile(
   terms: string[],
@@ -894,6 +736,189 @@ function mergeSkip(b: Budget, snapshot: PreparedSnapshot): void {
   }
 }
 
+function makeSnippets(text: string, needles: string[], preferred: number[] = []): Snippet[] {
+  const origLines = asLines(text);
+  const decodedLines = origLines.map((line) => decodeEntities(line));
+  const snippets: Snippet[] = [];
+  const used = new Set<number>();
+  const pick = (i: number) => {
+    const lineHay = foldSpace(`${origLines[i]}\n${decodedLines[i]}`).toLowerCase();
+    const hit = needles.find((t) => hayHas(lineHay, t));
+    if (!hit) return;
+    snippets.push({ line: i + 1, text: clipAround(decodedLines[i], hit) });
+    used.add(i);
+  };
+  for (const lineNo of preferred) {
+    if (snippets.length >= 2) break;
+    const i = lineNo - 1;
+    if (i >= 0 && i < origLines.length && !used.has(i)) pick(i);
+  }
+  for (let i = 0; i < origLines.length && snippets.length < 2; i++) {
+    if (!used.has(i)) pick(i);
+  }
+  return snippets;
+}
+
+function mergeHits(hits: SearchHit[]): SearchHit[] {
+  const merged = new Map<string, SearchHit>();
+  for (const hit of hits) {
+    const key = hit.kind === "lesson" ? `lesson:${pathKey(hit.path)}` : pathKey(hit.sourcePath ?? hit.path);
+    const prev = merged.get(key);
+    if (!prev) {
+      merged.set(key, { ...hit, snippets: [...hit.snippets] });
+      continue;
+    }
+    const rank: Record<string, number> = { digest: 3, derived: 2, original: 1, lesson: 0 };
+    if ((rank[hit.kind] ?? 0) > (rank[prev.kind] ?? 0)) {
+      prev.kind = hit.kind;
+      prev.path = hit.path;
+      prev.relPath = hit.relPath;
+      prev.sourcePath = hit.sourcePath ?? prev.path;
+      prev.sourceStatus = hit.sourceStatus ?? prev.sourceStatus;
+    }
+    if (hit.semanticMatch) {
+      prev.semanticMatch = true;
+      prev.semanticEvidence = prev.semanticEvidence ?? hit.semanticEvidence;
+    }
+    prev.pathScore = Math.max(prev.pathScore, hit.pathScore);
+    prev.partial = Boolean(prev.partial && hit.partial) || undefined;
+    if (!prev.snippets.length && hit.snippets.length) prev.snippets = hit.snippets;
+    if (hit.title && !prev.title) prev.title = hit.title;
+  }
+  return [...merged.values()].sort((a, b) => b.pathScore - a.pathScore || a.path.localeCompare(b.path));
+}
+
+async function semanticHits(root: LoadedRoot, terms: string[]): Promise<SearchHit[]> {
+  if (!root.realPath) return [];
+  const recs = await loadSemanticIndex(root.realPath);
+  const hits: SearchHit[] = [];
+  for (const rec of recs) {
+    const extra = semanticExtra(rec);
+    const hay = foldSpace(extra).toLowerCase();
+    if (!terms.every((t) => hayHas(hay, t))) continue;
+    let buf: Buffer;
+    try {
+      buf = await readFile(rec.path);
+    } catch {
+      continue;
+    }
+    if (sha256(buf) !== rec.sourceHash) continue;
+    hits.push({
+      kind: "original",
+      root: root.name,
+      path: rec.path,
+      relPath: relative(root.realPath, rec.path),
+      pathHit: false,
+      snippets: [],
+      pathScore: 1,
+      semanticMatch: true,
+      semanticEvidence: semanticEvidence(rec, terms),
+    });
+  }
+  return hits;
+}
+
+async function hitsFromIndexedRoot(
+  config: Extract<LoadedConfig, { ok: true }>,
+  root: LoadedRoot,
+  query: string,
+  limit: number,
+  b: Budget,
+  signal?: AbortSignal,
+  retried = false,
+): Promise<SearchHit[] | Fail> {
+  if (!root.realPath) return [];
+  const indexOpts = {
+    sourcePath: root.realPath,
+    sourceKey: pathKey(root.realPath),
+    skipInside: skipInsidePaths(root.realPath, config.writable?.realPath, root.writable),
+    exclude: root.exclude,
+    signal,
+    scanMs: 8000,
+  };
+  let found = await searchRootIndex(root.realPath, query, { limit });
+  if (!found.ok) return found;
+  if (!found.indexed) {
+    const built = await indexRoot(indexOpts);
+    if (built.ok) {
+      b.skipped += built.skipped ?? 0;
+      for (const reason of built.reasons ?? []) {
+        if (b.reasons.length < 8 && !b.reasons.includes(reason)) b.reasons.push(reason);
+      }
+    }
+    found = await searchRootIndex(root.realPath, query, { limit });
+    if (!found.ok) return found;
+  }
+  if (!found.indexed) return [];
+  const merged = new Map<string, SearchHit>();
+  for (const row of found.hits) {
+    const abs = join(root.realPath, row.relPath);
+    let buf: Buffer;
+    try {
+      buf = await readFile(abs);
+    } catch {
+      continue;
+    }
+    if (row.sourceHash && sha256(buf) !== row.sourceHash) continue;
+    const text = buf.toString("utf8");
+    const phrases = row.phrases ?? found.phrases ?? [];
+    if (phrases.length) {
+      const hay = foldSpace(`${text}\n${decodeEntities(text)}`).toLowerCase();
+      if (!phrases.every((p) => hay.includes(p.toLowerCase()))) continue;
+    }
+    if ((row.kind === "digest" || row.kind === "derived") && row.sourcePath) {
+      try {
+        const src = await readFile(row.sourcePath);
+        if (row.sourceFileHash && sha256(src) !== row.sourceFileHash) continue;
+      } catch {
+        continue;
+      }
+    }
+    const needles = row.needles ?? [];
+    const snippets = makeSnippets(text, needles, row.lines ?? []);
+    const decodedLines = asLines(text).map((line) => decodeEntities(line));
+    const preview = snippets.length ? undefined : clipAround(decodedLines.find((l) => l.trim()) ?? decodedLines[0] ?? "", needles[0] ?? "");
+    const hit: SearchHit = {
+      kind: row.kind === "digest" || row.kind === "lesson" || row.kind === "derived" ? row.kind : "original",
+      root: root.name,
+      path: abs,
+      relPath: row.relPath,
+      title: row.title,
+      catalog: row.catalog,
+      sourcePath: row.sourcePath,
+      sourceStatus: row.kind === "digest" ? "unchanged" : undefined,
+      pathHit: snippets.length === 0,
+      snippets,
+      preview,
+      pathScore: row.score ?? 0,
+      partial: row.partial || undefined,
+    };
+    const key = hit.kind === "lesson" ? `lesson:${pathKey(abs)}` : pathKey(hit.sourcePath ?? abs);
+    const prev = merged.get(key);
+    if (!prev) merged.set(key, hit);
+    else {
+      const rank: Record<string, number> = { digest: 3, derived: 2, original: 1, lesson: 0 };
+      if ((rank[hit.kind] ?? 0) > (rank[prev.kind] ?? 0)) {
+        prev.kind = hit.kind;
+        prev.path = hit.path;
+        prev.relPath = hit.relPath;
+        prev.sourcePath = hit.sourcePath ?? prev.path;
+        prev.sourceStatus = hit.sourceStatus ?? prev.sourceStatus;
+      }
+      prev.pathScore = Math.max(prev.pathScore, hit.pathScore);
+      prev.partial = Boolean(prev.partial && hit.partial) || undefined;
+      if (!prev.snippets.length && hit.snippets.length) prev.snippets = hit.snippets;
+      if (hit.title && !prev.title) prev.title = hit.title;
+    }
+  }
+  const out = [...merged.values()].sort((a, b) => b.pathScore - a.pathScore || a.path.localeCompare(b.path)).slice(0, limit);
+  if (!out.length && found.hits.length && !retried) {
+    await indexRoot(indexOpts);
+    return hitsFromIndexedRoot(config, root, query, limit, b, signal, true);
+  }
+  return out;
+}
+
 export async function searchKb(
   config: LoadedConfig,
   query: string,
@@ -905,23 +930,40 @@ export async function searchKb(
   const limit = Math.min(MAX_LIMIT, Math.max(1, opts.limit ?? DEFAULT_LIMIT));
   const b = newBudget(opts.signal);
   const writable = config.writable;
-  const writableReal = writable?.realPath ? [writable.realPath] : [];
+
+  async function fallbackRoot(root: LoadedRoot): Promise<SearchHit[] | Fail> {
+    const aiHits = root.writable ? await searchLayer(config, [root], [], terms, "ai", b) : [];
+    const prepared = await prepareReadonlyRoot(config, root, { signal: opts.signal });
+    if (!prepared.ok) return prepared;
+    mergeSkip(b, prepared.snapshot);
+    const origHits = hitsFromPrepared(prepared.snapshot, terms, root.name, await loadSemanticIndex(prepared.snapshot.sourcePath));
+    return [...aiHits, ...origHits];
+  }
+
+  async function searchRoot(root: LoadedRoot): Promise<SearchHit[] | Fail> {
+    const indexed = await hitsFromIndexedRoot(config, root, query, limit, b, opts.signal);
+    if (!Array.isArray(indexed)) return indexed;
+    const top = root.realPath ? await readTopManifest(root.realPath) : undefined;
+    const hits = indexed.length ? indexed : (top?.current ? indexed : await fallbackRoot(root));
+    if (!Array.isArray(hits)) return hits;
+    if (root.realPath) {
+      const semantic = await semanticHits(root, terms, query);
+      return mergeHits([...hits, ...semantic]);
+    }
+    return hits;
+  }
 
   if (opts.root) {
     const root = config.roots.find((r) => r.name === opts.root);
     if (!root) return { ok: false, error: `未知 root: ${opts.root}` };
     if (!root.exists) {
       if (root.writable) {
-        return { ok: true, hits: [], originalsSearched: !root.writable, truncated: false, skipped: 0, skipReasons: [] };
+        return { ok: true, hits: [], originalsSearched: true, truncated: false, skipped: 0, skipReasons: [] };
       }
       return { ok: false, error: `root 目录不存在: ${root.name} (${root.path})` };
     }
-    const aiHits = root.writable ? await searchLayer(config, [root], [], terms, "ai", b) : [];
-    const prepared = await prepareReadonlyRoot(config, root, { signal: opts.signal });
-    if (!prepared.ok) return prepared;
-    mergeSkip(b, prepared.snapshot);
-    const origHits = hitsFromPrepared(prepared.snapshot, terms, root.name, await loadSemanticIndex(prepared.snapshot.sourcePath));
-    const hits = [...aiHits, ...origHits].sort((a, b) => b.pathScore - a.pathScore || a.path.localeCompare(b.path));
+    const hits = await searchRoot(root);
+    if (!Array.isArray(hits)) return hits;
     return {
       ok: true,
       hits: hits.slice(0, limit),
@@ -932,38 +974,21 @@ export async function searchKb(
     };
   }
 
-  let aiHits: SearchHit[] = [];
-  if (writable?.exists && writable.realPath) {
-    aiHits = await searchLayer(config, [writable], [], terms, "ai", b);
-  } else if (writable && !writable.exists) {
-    /* empty writable is fine */
-  }
-  if (aiHits.length > 0) {
-    return {
-      ok: true,
-      hits: aiHits.slice(0, limit),
-      originalsSearched: false,
-      truncated: b.truncated,
-      skipped: b.skipped,
-      skipReasons: b.reasons,
-    };
-  }
   const readonlyRoots = config.roots.filter((r) => !r.writable);
   const missing = readonlyRoots.filter((r) => !r.exists);
-  if (missing.length && readonlyRoots.every((r) => !r.exists)) {
+  if (missing.length && readonlyRoots.every((r) => !r.exists) && !writable?.exists) {
     return { ok: false, error: `只读 root 不存在: ${missing.map((r) => r.name).join(", ")}` };
   }
-  const origHits: SearchHit[] = [];
+  const hits: SearchHit[] = [];
   for (const root of config.roots.filter((r) => r.exists)) {
-    const prepared = await prepareReadonlyRoot(config, root, { signal: opts.signal });
-    if (!prepared.ok) return prepared;
-    mergeSkip(b, prepared.snapshot);
-    origHits.push(...hitsFromPrepared(prepared.snapshot, terms, root.name, await loadSemanticIndex(prepared.snapshot.sourcePath)));
+    const part = await searchRoot(root);
+    if (!Array.isArray(part)) return part;
+    hits.push(...part);
   }
-  origHits.sort((a, b) => b.pathScore - a.pathScore || a.path.localeCompare(b.path));
+  const merged = mergeHits(hits);
   return {
     ok: true,
-    hits: origHits.slice(0, limit),
+    hits: merged.slice(0, limit),
     originalsSearched: true,
     truncated: b.truncated,
     skipped: b.skipped,
@@ -989,6 +1014,7 @@ export function formatSearch(result: SearchOk): string {
     lines.push(hit.path);
     if (hit.sourcePath) lines.push(`来源: ${hit.sourcePath}`);
     if (hit.pathHit) lines.push(`文件名/路径命中${hit.preview ? `: ${hit.preview}` : ""}`);
+    if (hit.partial) lines.push("部分匹配");
     if (hit.semanticMatch) lines.push(`语义索引匹配${hit.semanticEvidence ? `: ${hit.semanticEvidence}` : ""}`);
     for (const s of hit.snippets) lines.push(`L${s.line}: ${s.text}`);
   }
@@ -1103,7 +1129,20 @@ export async function writeLesson(
     author: AUTHOR,
     cwd: input.cwd,
   };
-  return publishFile(dirReal, fileName, formatNote(meta, input.title.trim(), input.body), "lesson", "retry");
+  const published = await publishFile(dirReal, fileName, formatNote(meta, input.title.trim(), input.body), "lesson", "retry");
+  if (published.ok && config.ok) await refreshWritableIndex(config);
+  return published;
+}
+
+async function refreshWritableIndex(config: Extract<LoadedConfig, { ok: true }>): Promise<void> {
+  const root = config.writable;
+  if (!root?.realPath) return;
+  await indexRoot({
+    sourcePath: root.realPath,
+    sourceKey: pathKey(root.realPath),
+    skipInside: skipInsidePaths(root.realPath, root.realPath, true),
+    exclude: root.exclude,
+  });
 }
 
 export async function writeDigest(
@@ -1152,13 +1191,8 @@ export async function writeDigest(
     if (again) return { ok: true, path: again, kind: "digest", status: "already_exists" };
     return { ok: false, error: "同版本整理正在写入或损坏，请重试" };
   }
+  if (published.ok && config.ok) await refreshWritableIndex(config);
   return published;
-}
-
-export function sourceTitleFrom(path: string, text: string): string {
-  const heading = /^#\s+(.+)$/m.exec(text);
-  if (heading) return heading[1].trim().slice(0, TITLE_MAX);
-  return basename(path, extname(path));
 }
 
 export async function formatStatus(config: LoadedConfig): Promise<string> {
@@ -1168,7 +1202,7 @@ export async function formatStatus(config: LoadedConfig): Promise<string> {
     lines.push("策略: 未宣称知识库可用");
     return lines.join("\n");
   }
-  lines.push("策略: AI 笔记优先；完整读原文后可整理；不改原笔记");
+  lines.push("策略: 联合检索原文与 AI 笔记；完整读原文后可整理；不改原笔记");
   lines.push(`格式: ${[...TEXT_EXTS].join(" ")}`);
   if (config.enrich) lines.push(`清洗模型: ${config.enrich.provider}/${config.enrich.model}`);
   else lines.push("清洗模型: 未配置（导入时可选择）");
@@ -1180,6 +1214,16 @@ export async function formatStatus(config: LoadedConfig): Promise<string> {
     lines.push(`- ${root.name} (${rw}) ${root.path} [${avail}]${ex}`);
     const job = jobs.get(root.name);
     if (job) lines.push(`  ${job}`);
+    if (root.realPath) {
+      const top = await readTopManifest(root.realPath);
+      if (top) {
+        const gen = await readGeneration(root.realPath, top.current);
+        const state = gen?.complete === false ? "建立中" : "就绪";
+        lines.push(`  索引: ${state} 世代 ${top.current} 文档 ${gen?.docCount ?? "?"}`);
+      } else {
+        lines.push("  索引: 未建立");
+      }
+    }
   }
   return lines.join("\n");
 }
@@ -1291,6 +1335,21 @@ export async function saveConfigFile(
   return loadConfigFile(configPath, home);
 }
 
+function scheduleIndex(
+  config: Extract<LoadedConfig, { ok: true }>,
+  root: LoadedRoot,
+  mode: "meta" | "full" = "meta",
+): void {
+  if (!root.realPath) return;
+  void indexRoot({
+    sourcePath: root.realPath,
+    sourceKey: pathKey(root.realPath),
+    skipInside: skipInsidePaths(root.realPath, config.writable?.realPath, root.writable),
+    exclude: root.exclude,
+    mode,
+  });
+}
+
 async function afterAddReadonly(
   config: Extract<LoadedConfig, { ok: true }>,
   name: string,
@@ -1313,6 +1372,7 @@ async function afterAddReadonly(
   }
   const extra = prepared.persistError ? `；${prepared.persistError}` : "";
   ui.notify(`规则清洗完成：${prepared.processed} 篇${extra}`);
+  scheduleIndex(config, root);
   if (!hooks) return config;
   const useAi = await ui.confirm("使用 AI 全量语义整理？", `${name} 共 ${prepared.processed} 篇。仅规则清洗也可搜索。`);
   if (!useAi) return config;
@@ -1363,6 +1423,7 @@ export async function configureKbInteractive(
         const root = config.roots.find((r) => r.name === name);
         if (!root) continue;
         const prepared = await prepareReadonlyRoot(config, root);
+        if (prepared.ok) scheduleIndex(config, root, "full");
         ui.notify(prepared.ok ? `已刷新 ${name}：${prepared.processed} 篇 ${prepared.status}` : prepared.error, prepared.ok ? "info" : "error");
         continue;
       }
@@ -1440,13 +1501,6 @@ export function isOriginalTextFile(config: Extract<LoadedConfig, { ok: true }>, 
   return true;
 }
 
-export function cacheDirFor(sourcePath: string): string {
-  return join(sourcePath, CACHE_DIRNAME);
-}
-
-export function sourceCachePath(sourcePath: string): string {
-  return join(cacheDirFor(sourcePath), "snapshot.json");
-}
 
 async function migrateLegacyCache(configPath: string, sourcePath: string): Promise<void> {
   const destDir = cacheDirFor(sourcePath);
@@ -1485,67 +1539,6 @@ async function migrateLegacyCache(configPath: string, sourcePath: string): Promi
   }
 }
 
-export function parseShowDocReadme(text: string): Map<string, string> {
-  const fileToTitle = new Map<string, string>();
-  const conflict = new Set<string>();
-  for (const line of asLines(text)) {
-    const m = line.match(/^\s*(.+?)\s+(?:——|--)\s+(\S+\.[A-Za-z0-9]+)\s*$/);
-    if (!m) continue;
-    const title = m[1].trim();
-    const file = m[2].replaceAll("\\", "/");
-    if (!title || file.includes("..")) {
-      conflict.add(file);
-      continue;
-    }
-    const prev = fileToTitle.get(file);
-    if (prev && prev !== title) conflict.add(file);
-    else fileToTitle.set(file, title);
-  }
-  for (const file of conflict) fileToTitle.delete(file);
-  return fileToTitle;
-}
-
-function isShowDocInfo(raw: unknown): raw is { pages: { pages?: unknown[]; catalogs?: unknown[] } } {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
-  const pages = (raw as { pages?: unknown }).pages;
-  if (!pages || typeof pages !== "object" || Array.isArray(pages)) return false;
-  const rec = pages as { pages?: unknown; catalogs?: unknown };
-  return Array.isArray(rec.pages) || Array.isArray(rec.catalogs);
-}
-
-function collectShowDocCatalogs(
-  node: { pages?: unknown[]; catalogs?: unknown[] },
-  parents: string[],
-  out: Map<string, string[]>,
-  dups: Set<string>,
-): void {
-  for (const page of node.pages ?? []) {
-    if (!page || typeof page !== "object") continue;
-    const title = (page as { page_title?: unknown }).page_title;
-    if (typeof title !== "string" || !title.trim()) continue;
-    const key = title.trim();
-    if (out.has(key) || dups.has(key)) {
-      dups.add(key);
-      out.delete(key);
-      continue;
-    }
-    out.set(key, parents);
-  }
-  for (const cat of node.catalogs ?? []) {
-    if (!cat || typeof cat !== "object") continue;
-    const rec = cat as { cat_name?: unknown; pages?: unknown[]; catalogs?: unknown[] };
-    const name = typeof rec.cat_name === "string" ? rec.cat_name.trim() : "";
-    collectShowDocCatalogs(rec, name ? [...parents, name] : parents, out, dups);
-  }
-}
-
-export function parseShowDocInfo(raw: unknown): Map<string, string[]> | null {
-  if (!isShowDocInfo(raw)) return null;
-  const out = new Map<string, string[]>();
-  const dups = new Set<string>();
-  collectShowDocCatalogs(raw.pages, [], out, dups);
-  return out;
-}
 
 function isPreparedDoc(raw: unknown): raw is PreparedDoc {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
@@ -1715,7 +1708,7 @@ function snapshotFingerprint(snapshot: Pick<PreparedSnapshot, "sourceKey" | "exc
   }));
 }
 
-function skipInsideForPrepare(config: Extract<LoadedConfig, { ok: true }>, root: LoadedRoot): string[] {
+export function skipInsideForPrepare(config: Extract<LoadedConfig, { ok: true }>, root: LoadedRoot): string[] {
   const skip: string[] = [];
   if (root.realPath) skip.push(cacheDirFor(root.realPath));
   const w = config.writable?.realPath;

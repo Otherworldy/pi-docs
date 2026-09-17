@@ -15,7 +15,9 @@ import {
   DEFAULT_MAX_OUTPUT_TOKENS,
   RULE_VERSION,
   cacheDirFor,
+  formatNote,
   pathKey,
+  sha256,
   type EnrichSettings,
   type Fail,
   type LoadedConfig,
@@ -23,6 +25,8 @@ import {
   type PreparedSnapshot,
   prepareReadonlyRoot,
 } from "./kb.ts";
+import { commitIndex, docIdFor } from "./index-store.mjs";
+import { postingsForDoc } from "./retrieval.mjs";
 
 export const PROMPT_VERSION = 1;
 export const CHUNK_VERSION = 1;
@@ -132,16 +136,31 @@ export function splitChunks(doc: PreparedDoc): { startLine: number; endLine: num
   const ranges: { startLine: number; endLine: number }[] = [];
   let start = 1;
   let chars = 0;
+  let fence: string | undefined;
+  let table = false;
   for (let i = 0; i < doc.lines.length; i++) {
     const lineNo = i + 1;
-    const next = (doc.lines[i] ?? "").length + 1;
-    const heading = i > 0 && /^#{1,6}\s+\S/.test((doc.lines[i] ?? "").trim());
+    const raw = doc.lines[i] ?? "";
+    const trimmed = raw.trim();
+    const wasFence = !!fence;
+    const mark = /^(```+|~~~+)/.exec(trimmed);
+    if (mark) {
+      const ch = mark[1][0];
+      if (!fence) fence = ch;
+      else if (ch === fence) fence = undefined;
+    }
+    const isTable = /^\s*\|/.test(raw);
+    if (!isTable) table = false;
+    else if (!table) table = true;
+    const next = raw.length + 1;
+    const heading = i > 0 && !wasFence && !fence && /^#{1,6}\s+\S/.test(trimmed);
+    const canSplit = !wasFence && !fence && !table;
     if (ranges.length === 0 && i === 0) chars = next;
-    else if (chars + next > MAX_CHUNK_CHARS && lineNo > start) {
+    else if (canSplit && chars + next > MAX_CHUNK_CHARS && lineNo > start) {
       ranges.push({ startLine: start, endLine: lineNo - 1 });
       start = lineNo;
       chars = next;
-    } else if (heading && chars > MAX_CHUNK_CHARS / 2) {
+    } else if (canSplit && heading && chars > MAX_CHUNK_CHARS / 2) {
       ranges.push({ startLine: start, endLine: lineNo - 1 });
       start = lineNo;
       chars = next;
@@ -321,7 +340,7 @@ export function validateModelOutput(raw: unknown, doc: PreparedDoc, startLine: n
       if (!text || !excerpt || !Number.isInteger(s) || !Number.isInteger(e)) return { ok: false, error: "规则字段无效" };
       if (s < startLine || e > endLine || s > e) return { ok: false, error: "规则行号越界" };
       const slice = doc.lines.slice(s - 1, e).join("\n");
-      if (!slice.includes(excerpt) && !excerpt.includes(slice.slice(0, Math.min(slice.length, excerpt.length)))) {
+      if (!slice.includes(excerpt)) {
         return { ok: false, error: "摘录不在原文范围内" };
       }
       rules.push({ text: text.slice(0, 400), startLine: s, endLine: e, excerpt: excerpt.slice(0, 300) });
@@ -518,14 +537,89 @@ export async function startEnrichment(
     }
 
     job.records = materializeRecords(job, docs, config.enrich);
+    await publishDerivedNotes(sourcePath, sourceKey, job.records, docs);
     await saveSemantics(sourcePath, sourceKey, job.records);
-    await saveJob(sourcePath, job);
+    await saveJob(sourcePath, { ...job, chunks: job.chunks.map((c) => ({ ...c, output: c.status === "completed" ? c.output : undefined })) });
     const summary = jobSummary(job);
     opts.onProgress?.(summary);
     return summary;
   } finally {
     await releaseLock(sourcePath, lock.token);
   }
+}
+
+function derivedBody(rec: SemanticRecord): string {
+  const rules = rec.rules.map((r) => `- ${r.text}（L${r.startLine}-${r.endLine}）\n  ${r.excerpt}`).join("\n");
+  const aliases = rec.aliases.length ? rec.aliases.map((a) => `- ${a}`).join("\n") : "（无）";
+  const questions = rec.questions.length ? rec.questions.map((q) => `- ${q}`).join("\n") : "（无）";
+  return [
+    "## 内容与适用",
+    rec.summary || "（无）",
+    "",
+    "## 规则、约束与例外",
+    rules || "（无）",
+    "",
+    "## 别名与常见问法",
+    "别名：",
+    aliases,
+    "",
+    "问法（用于检索，不是已支持功能清单）：",
+    questions,
+  ].join("\n");
+}
+
+async function publishDerivedNotes(
+  sourcePath: string,
+  sourceKey: string,
+  records: SemanticRecord[],
+  docs: Map<string, PreparedDoc>,
+): Promise<void> {
+  if (!records.length) return;
+  const noteDir = join(cacheDirFor(sourcePath), "notes");
+  await mkdir(noteDir, { recursive: true, mode: 0o700 });
+  const upserts = [];
+  for (const rec of records) {
+    const doc = docs.get(pathKey(rec.path));
+    if (!doc) continue;
+    const origId = docIdFor(sourceKey, doc.relPath);
+    const relPath = `.pi-kb/notes/${origId}.md`;
+    const body = derivedBody(rec);
+    const text = formatNote({
+      type: "derived",
+      createdAt: new Date().toISOString(),
+      author: "pi-kb",
+      cwd: sourcePath,
+      sourcePath: rec.path,
+      sourceHash: rec.sourceHash,
+      sourceTitle: rec.title,
+      coverage: "derived",
+    }, rec.title, body);
+    const notePath = join(noteDir, `${origId}.md`);
+    const tmp = join(noteDir, `.${origId}-${randomUUID()}.tmp`);
+    await writeFile(tmp, text, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    try { await chmod(tmp, 0o600); } catch { /* windows */ }
+    await rename(tmp, notePath);
+    upserts.push({
+      doc: {
+        docId: docIdFor(sourceKey, relPath),
+        relPath,
+        kind: "derived",
+        title: rec.title,
+        catalog: rec.catalog,
+        sourceHash: sha256(Buffer.from(text)),
+        sourcePath: rec.path,
+        sourceFileHash: rec.sourceHash,
+      },
+      postings: postingsForDoc({
+        relPath,
+        title: rec.title,
+        catalog: rec.catalog,
+        lines: body.split("\n"),
+        extra: [...rec.topics, ...rec.aliases, ...rec.questions].join("\n"),
+      }),
+    });
+  }
+  if (upserts.length) await commitIndex(sourcePath, { sourceKey, upserts, complete: true });
 }
 
 function materializeRecords(

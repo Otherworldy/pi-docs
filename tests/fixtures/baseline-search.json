@@ -1,0 +1,83 @@
+{
+  "capturedAt": "2026-09-17T02:31:58.616Z",
+  "node": "v24.15.0",
+  "testPass": 44,
+  "notes": "Pre-index-refactor baseline. No document bodies. Current search is AI-first and stops when digest/lesson hits exist.",
+  "queries": [
+    {
+      "query": "selectCompare headerField",
+      "root": null,
+      "ok": true,
+      "originalsSearched": false,
+      "hits": [
+        { "kind": "digest", "root": "agent", "title": null, "relPath": "digests/*.md" }
+      ]
+    },
+    {
+      "query": "headerField",
+      "root": "obsidian",
+      "ok": true,
+      "originalsSearched": true,
+      "hits": [
+        { "kind": "original", "root": "obsidian", "title": "selectCompare 注意项", "relPath": "插件/selectCompare/selectCompare 注意项.md" }
+      ]
+    },
+    {
+      "query": "Searchbar 或",
+      "root": "项目文档",
+      "ok": true,
+      "originalsSearched": true,
+      "hits": [
+        { "kind": "original", "root": "项目文档", "title": "搜索栏Searchbar", "relPath": "prefix_3810e7a03e2c205c1b0d13761f5527a4.md" }
+      ]
+    },
+    {
+      "query": "搜索栏 或",
+      "root": "项目文档",
+      "ok": true,
+      "originalsSearched": true,
+      "hits": [
+        { "kind": "original", "root": "项目文档", "title": "搜索栏Searchbar", "relPath": "prefix_3810e7a03e2c205c1b0d13761f5527a4.md" }
+      ]
+    },
+    {
+      "query": "员工 同步 离职",
+      "root": "项目文档",
+      "ok": true,
+      "originalsSearched": true,
+      "hits": [
+        { "kind": "original", "root": "项目文档", "title": "人才分析的关键指标", "relPath": "prefix_d65a5e5ea627dc549bb8656a9dd60113.md" }
+      ],
+      "expectedTitle": "同步数据离职人员的处理规范",
+      "knownMiss": true
+    },
+    {
+      "query": "离职 标记",
+      "root": "项目文档",
+      "ok": true,
+      "originalsSearched": true,
+      "hits": [
+        { "kind": "original", "root": "项目文档", "title": "同步数据离职人员的处理规范", "relPath": "prefix_1367f5c8df2039aec46c9c83abe8e4f7.md" },
+        { "kind": "original", "root": "项目文档", "title": "人才档案", "relPath": "prefix_34b057f983e23c1e5065abfbb0a7665d.md" }
+      ]
+    },
+    {
+      "query": "observed.FullName",
+      "root": null,
+      "ok": true,
+      "originalsSearched": false,
+      "hits": [
+        { "kind": "digest", "root": "agent", "title": null, "relPath": "digests/*.md" }
+      ]
+    },
+    {
+      "query": "同步数据 离职人员",
+      "root": null,
+      "ok": true,
+      "originalsSearched": true,
+      "hits": [
+        { "kind": "original", "root": "项目文档", "title": "同步数据离职人员的处理规范", "relPath": "prefix_1367f5c8df2039aec46c9c83abe8e4f7.md" }
+      ]
+    }
+  ]
+}

@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { loadConfigFile, searchKb, type EnrichSettings } from "../lib/kb.ts";
 import {
+  MAX_CHUNK_CHARS,
   loadJob,
   splitChunks,
   startEnrichment,
@@ -42,6 +43,14 @@ describe("semantic", () => {
       rules: [{ text: "or", startLine: 1, endLine: 1, excerpt: "不存在" }],
     }, doc, 1, 2);
     assert.equal("ok" in bad && bad.ok === false, true);
+    const prefix = validateModelOutput({
+      summary: "x",
+      topics: [],
+      aliases: [],
+      questions: [],
+      rules: [{ text: "or", startLine: 1, endLine: 1, excerpt: "条件是与关系的补充" }],
+    }, doc, 1, 2);
+    assert.equal("ok" in prefix && prefix.ok === false, true);
     const good = validateModelOutput({
       summary: "筛选",
       topics: ["Searchbar"],
@@ -50,6 +59,21 @@ describe("semantic", () => {
       rules: [{ text: "AND", startLine: 2, endLine: 2, excerpt: "不支持或" }],
     }, doc, 1, 2);
     assert.equal("ok" in good, false);
+  });
+
+  it("does not split inside fenced code", () => {
+    const fence = ["# t", "```", "x".repeat(MAX_CHUNK_CHARS + 50), "```", "# next", "tail"];
+    const parts = splitChunks({
+      path: "/n/a.md",
+      relPath: "a.md",
+      title: "t",
+      catalog: [],
+      sourceHash: "h",
+      lines: fence,
+    });
+    const covering = parts.find((p) => p.startLine <= 3 && p.endLine >= 3);
+    assert.ok(covering);
+    assert.ok((covering?.endLine ?? 0) >= 4);
   });
 
   it("splits long documents into covering chunks", () => {
@@ -210,7 +234,7 @@ describe("semantic", () => {
     assert.equal(hit.ok, true);
     if (!hit.ok) return;
     assert.equal(hit.hits.length, 1);
-    assert.equal(hit.hits[0].kind, "original");
+    assert.ok(hit.hits[0].kind === "derived" || hit.hits[0].kind === "original");
   });
 
   it("abort pauses the in-flight chunk instead of failing it", async () => {

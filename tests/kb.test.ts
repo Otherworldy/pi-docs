@@ -382,7 +382,7 @@ describe("search", () => {
     assert.equal(empty.ok, true);
     if (!empty.ok) return;
     assert.equal(empty.hits.length, 0);
-    assert.equal(empty.originalsSearched, false);
+    assert.equal(empty.originalsSearched, true);
   });
 
   it("skips symlink files/dirs and prefix-named sibling dirs", async () => {
@@ -445,11 +445,11 @@ describe("ai-first search and write", () => {
     const r = await searchKb(loaded, "headerField");
     assert.equal(r.ok, true);
     if (!r.ok || !w.ok) return;
-    assert.equal(r.originalsSearched, false);
-    assert.equal(r.hits.length, 1);
+    assert.equal(r.originalsSearched, true);
     assert.equal(r.hits[0].kind, "digest");
     assert.equal(r.hits[0].sourceStatus, "unchanged");
     assert.equal(r.hits[0].path, w.path);
+    assert.equal(r.hits.some((h) => h.kind === "original"), false);
   });
 
   it("falls back to originals when digest source changed", async () => {

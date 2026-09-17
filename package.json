@@ -6,6 +6,7 @@
   "files": [
     "extensions/**/*.ts",
     "lib/**/*.ts",
+    "lib/**/*.mjs",
     "README.md"
   ],
   "keywords": [
@@ -18,7 +19,8 @@
   ],
   "license": "MIT",
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/*.test.ts"
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "bench": "node scripts/bench-kb.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

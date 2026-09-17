@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "notes": "Sanitized recall labels. No private document bodies. baseline reflects pre-index-refactor searchKb.",
+  "cases": [
+    {
+      "id": "searchbar-or",
+      "query": "Searchbar 或",
+      "root": "项目文档",
+      "expectTitle": "搜索栏Searchbar",
+      "baseline": { "hit": true, "originalsSearched": true }
+    },
+    {
+      "id": "searchbar-cn-or",
+      "query": "搜索栏 或",
+      "root": "项目文档",
+      "expectTitle": "搜索栏Searchbar",
+      "baseline": { "hit": true, "originalsSearched": true }
+    },
+    {
+      "id": "leave-sync-terms",
+      "query": "员工 同步 离职",
+      "root": "项目文档",
+      "expectTitle": "同步数据离职人员的处理规范",
+      "baseline": { "hit": false, "wrongTitle": "人才分析的关键指标" }
+    },
+    {
+      "id": "leave-mark",
+      "query": "离职 标记",
+      "root": "项目文档",
+      "expectTitle": "同步数据离职人员的处理规范",
+      "baseline": { "hit": true, "originalsSearched": true }
+    },
+    {
+      "id": "selectcompare-header",
+      "query": "selectCompare headerField",
+      "expectRelPathIncludes": "selectCompare",
+      "baseline": { "kind": "digest", "originalsSearched": false }
+    }
+  ]
+}
