@@ -423,7 +423,11 @@ export async function startEnrichment(
     await saveJob(sourcePath, job);
     progress();
     for (const chunk of job.chunks) {
-      if (job.paused || opts.signal?.aborted) break;
+      if (opts.signal?.aborted) {
+        job.paused = true;
+        break;
+      }
+      if (job.paused) break;
       if (chunk.status === "completed") continue;
       const doc = docs.get(pathKey(chunk.docPath));
       if (!doc || doc.sourceHash !== chunk.sourceHash) {
@@ -447,6 +451,11 @@ export async function startEnrichment(
           timeoutMs: config.enrich.timeoutMs,
           signal: opts.signal,
         });
+        if (opts.signal?.aborted) {
+          chunk.status = "pending";
+          job.paused = true;
+          break;
+        }
         job.inputTokens += result.inputTokens;
         job.outputTokens += result.outputTokens;
         if (result.costUnknown) job.costUnknown = true;
@@ -456,7 +465,7 @@ export async function startEnrichment(
         } catch {
           parsed = { ok: false, error: "结果不是 JSON" };
         }
-        if ("ok" in parsed && job.requests < job.maxRequests) {
+        if ("ok" in parsed && job.requests < job.maxRequests && !opts.signal?.aborted) {
           job.requests += 1;
           const retry = await complete({
             system: SYSTEM,
@@ -465,6 +474,11 @@ export async function startEnrichment(
             timeoutMs: config.enrich.timeoutMs,
             signal: opts.signal,
           });
+          if (opts.signal?.aborted) {
+            chunk.status = "pending";
+            job.paused = true;
+            break;
+          }
           job.inputTokens += retry.inputTokens;
           job.outputTokens += retry.outputTokens;
           try {
@@ -483,6 +497,12 @@ export async function startEnrichment(
           chunk.output = parsed;
         }
       } catch (err) {
+        if (opts.signal?.aborted) {
+          chunk.status = "pending";
+          chunk.error = undefined;
+          job.paused = true;
+          break;
+        }
         chunk.status = "failed";
         chunk.error = err instanceof Error ? err.message : "调用失败";
         job.costUnknown = true;
@@ -491,6 +511,10 @@ export async function startEnrichment(
       }
       await saveJob(sourcePath, job);
       progress();
+      if (opts.signal?.aborted) {
+        job.paused = true;
+        break;
+      }
     }
 
     job.records = materializeRecords(job, docs, config.enrich);

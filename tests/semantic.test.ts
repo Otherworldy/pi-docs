@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { loadConfigFile, searchKb, type EnrichSettings } from "../lib/kb.ts";
 import {
+  loadJob,
   splitChunks,
   startEnrichment,
   validateModelOutput,
@@ -210,5 +211,33 @@ describe("semantic", () => {
     if (!hit.ok) return;
     assert.equal(hit.hits.length, 1);
     assert.equal(hit.hits[0].kind, "original");
+  });
+
+  it("abort pauses the in-flight chunk instead of failing it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-kb-abort-"));
+    const notes = join(dir, "notes");
+    await write(join(notes, "a.md"), "alpha-token\n");
+    await write(join(notes, "b.md"), "beta-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    await writeFile(configPath, JSON.stringify({ roots: [{ name: "notes", path: notes }], enrich }));
+    const loaded = await loadConfigFile(configPath);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const ac = new AbortController();
+    let calls = 0;
+    const complete: ModelComplete = async ({ signal }) => {
+      calls += 1;
+      ac.abort();
+      if (signal?.aborted) throw new Error("aborted");
+      return { text: "x", inputTokens: 1, outputTokens: 1 };
+    };
+    const status = await startEnrichment(loaded, "notes", complete, { signal: ac.signal });
+    assert.match(status, /已暂停/);
+    assert.equal(calls, 1);
+    const job = await loadJob(notes);
+    assert.ok(job);
+    assert.equal(job!.paused, true);
+    assert.equal(job!.chunks.some((c) => c.status === "failed"), false);
+    assert.ok(job!.chunks.every((c) => c.status === "pending"));
   });
 });

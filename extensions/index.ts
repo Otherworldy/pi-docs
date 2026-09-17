@@ -99,7 +99,9 @@ function makeComplete(ctx: { modelRegistry?: { find?: Function; complete?: Funct
   };
 }
 
-function enrichHooksFor(ctx: any, configPath: string, home: string): EnrichHooks {
+type EnrichRun = { ac: AbortController; done: Promise<string> };
+
+function enrichHooksFor(ctx: any, configPath: string, home: string, runs: Map<string, EnrichRun>): EnrichHooks {
   return {
     async resolveModel(current) {
       const registry = ctx?.modelRegistry;
@@ -122,14 +124,36 @@ function enrichHooksFor(ctx: any, configPath: string, home: string): EnrichHooks
     },
     async start(loaded, rootName) {
       if (!loaded.enrich) return "未配置清洗模型";
-      return startEnrichment(loaded, rootName, makeComplete(ctx, loaded.enrich), {
+      if (runs.has(rootName)) return `${rootName} 已在后台整理，进度在底栏`;
+      const ac = new AbortController();
+      const done = startEnrichment(loaded, rootName, makeComplete(ctx, loaded.enrich), {
+        signal: ac.signal,
         onProgress(text) {
           ctx.ui?.setStatus?.("pi-kb", text);
           ctx.ui?.notify?.(text);
         },
+      }).then((summary) => {
+        ctx.ui?.setStatus?.("pi-kb", summary);
+        ctx.ui?.notify?.(summary);
+        return summary;
+      }).catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui?.notify?.(`整理失败: ${msg}`, "error");
+        return `整理失败: ${msg}`;
+      }).finally(() => {
+        const cur = runs.get(rootName);
+        if (cur?.ac === ac) runs.delete(rootName);
       });
+      runs.set(rootName, { ac, done });
+      return `已开始整理 ${rootName}，可继续对话；进度在底栏`;
     },
     async pause(rootName) {
+      const run = runs.get(rootName);
+      if (run) {
+        run.ac.abort();
+        await run.done;
+        return `已请求暂停 ${rootName}`;
+      }
       const loaded = await loadConfigFile(configPath, home);
       if (!loaded.ok) return loaded.error;
       const root = loaded.roots.find((r) => r.name === rootName);
@@ -153,6 +177,7 @@ export function createKbExtension(opts: KbOptions = {}) {
     const pending = new Map<string, PendingRead>();
     const refs = new Map<string, ReadRef>();
     const prompted = new Set<string>();
+    const enrichRuns = new Map<string, EnrichRun>();
     const home = opts.homedir ?? homedir();
 
     async function reload() {
@@ -171,7 +196,10 @@ export function createKbExtension(opts: KbOptions = {}) {
       }
     });
 
-    pi.on("session_shutdown", () => {
+    pi.on("session_shutdown", async () => {
+      const running = [...enrichRuns.values()];
+      for (const run of running) run.ac.abort();
+      await Promise.allSettled(running.map((r) => r.done));
       pending.clear();
       refs.clear();
       prompted.clear();
@@ -256,7 +284,7 @@ export function createKbExtension(opts: KbOptions = {}) {
       handler: async (_args, ctx) => {
         const configPath = opts.configPath ?? join(getAgentDir(), CONFIG_FILENAME);
         const args = String(_args ?? "").trim();
-        const hooks = enrichHooksFor(ctx, configPath, home);
+        const hooks = enrichHooksFor(ctx, configPath, home, enrichRuns);
         if (!ctx.hasUI) {
           config = await loadConfigFile(configPath, home);
           if (!config.ok) return;

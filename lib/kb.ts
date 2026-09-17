@@ -1386,7 +1386,7 @@ export async function configureKbInteractive(
         }
         config = savedModel;
         ui.notify(await hooks.start(savedModel, name));
-        continue;
+        return savedModel;
       }
       const name = await ui.select("暂停哪个目录？", names);
       if (!name) continue;
