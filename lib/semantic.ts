@@ -12,7 +12,9 @@ import {
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
+  DEFAULT_CONCURRENCY,
   DEFAULT_MAX_OUTPUT_TOKENS,
+  MAX_CONCURRENCY,
   RULE_VERSION,
   cacheDirFor,
   formatNote,
@@ -32,6 +34,7 @@ export const PROMPT_VERSION = 1;
 export const CHUNK_VERSION = 1;
 export const JOB_VERSION = 1;
 export const MAX_CHUNK_CHARS = 12_000;
+export { DEFAULT_CONCURRENCY, MAX_CONCURRENCY };
 
 export type ModelComplete = (input: {
   system: string;
@@ -419,11 +422,22 @@ export async function pauseJob(sourcePath: string): Promise<string> {
   return `已请求暂停 ${job.rootName}`;
 }
 
+function clampConcurrency(n: number | undefined): number {
+  if (!Number.isInteger(n) || !n || n < 1) return DEFAULT_CONCURRENCY;
+  return Math.min(MAX_CONCURRENCY, n);
+}
+
+async function runPool(limit: number, work: () => Promise<boolean>): Promise<void> {
+  await Promise.all(Array.from({ length: Math.max(1, limit) }, async () => {
+    while (await work()) { /* drain */ }
+  }));
+}
+
 export async function startEnrichment(
   config: Extract<LoadedConfig, { ok: true }>,
   rootName: string,
   complete: ModelComplete,
-  opts: { signal?: AbortSignal; maxRequests?: number; onProgress?: (text: string) => void; mode?: "full" | "incremental" } = {},
+  opts: { signal?: AbortSignal; maxRequests?: number; onProgress?: (text: string) => void; mode?: "full" | "incremental"; concurrency?: number } = {},
 ): Promise<string> {
   if (!config.enrich) return "未配置清洗模型";
   const root = config.roots.find((r) => r.name === rootName);
@@ -440,41 +454,63 @@ export async function startEnrichment(
     job.paused = false;
     const docs = new Map(prepared.snapshot.docs.map((d) => [pathKey(d.path), d]));
     const progress = (title?: string) => opts.onProgress?.(jobSummary(job, title));
+    const runAc = new AbortController();
+    const stop = () => {
+      job.paused = true;
+      if (!runAc.signal.aborted) runAc.abort();
+    };
+    if (opts.signal?.aborted) stop();
+    else opts.signal?.addEventListener("abort", stop, { once: true });
+    const signal = runAc.signal;
+    let cursor = 0;
+    let writing = Promise.resolve<unknown>(undefined);
+    const persist = () => {
+      writing = writing.then(() => saveJob(sourcePath, job), () => saveJob(sourcePath, job));
+      return writing;
+    };
+    const take = (): { chunk: JobChunk; doc: PreparedDoc } | undefined => {
+      if (job.paused || signal.aborted) return;
+      while (cursor < job.chunks.length) {
+        const chunk = job.chunks[cursor++];
+        if (chunk.status === "completed") continue;
+        const doc = docs.get(pathKey(chunk.docPath));
+        if (!doc || doc.sourceHash !== chunk.sourceHash) {
+          chunk.status = "stale";
+          continue;
+        }
+        if (job.requests >= job.maxRequests) {
+          job.paused = true;
+          return;
+        }
+        chunk.status = "running";
+        job.requests += 1;
+        return { chunk, doc };
+      }
+    };
+    const callModel = (user: string) => complete({
+      system: SYSTEM,
+      user,
+      maxTokens: config.enrich!.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+      timeoutMs: config.enrich!.timeoutMs,
+      signal,
+    });
     await saveJob(sourcePath, job);
     progress();
-    for (const chunk of job.chunks) {
-      if (opts.signal?.aborted) {
-        job.paused = true;
-        break;
-      }
-      if (job.paused) break;
-      if (chunk.status === "completed") continue;
-      const doc = docs.get(pathKey(chunk.docPath));
-      if (!doc || doc.sourceHash !== chunk.sourceHash) {
-        chunk.status = "stale";
-        continue;
-      }
-      if (job.requests >= job.maxRequests) {
-        job.paused = true;
-        break;
-      }
-      chunk.status = "running";
-      job.requests += 1;
+    const limit = clampConcurrency(opts.concurrency ?? config.enrich.concurrency);
+    await runPool(limit, async () => {
+      const next = take();
+      if (!next) return false;
+      const { chunk, doc } = next;
       progress(doc.title);
       const body = doc.lines.slice(chunk.startLine - 1, chunk.endLine).map((line, i) => `${chunk.startLine + i}|${line}`).join("\n");
       const user = `标题: ${doc.title}\n分类: ${doc.catalog.join(" / ")}\n行 ${chunk.startLine}-${chunk.endLine}:\n${body}`;
       try {
-        const result = await complete({
-          system: SYSTEM,
-          user,
-          maxTokens: config.enrich.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-          timeoutMs: config.enrich.timeoutMs,
-          signal: opts.signal,
-        });
-        if (opts.signal?.aborted) {
+        const result = await callModel(user);
+        if (signal.aborted) {
           chunk.status = "pending";
-          job.paused = true;
-          break;
+          chunk.error = undefined;
+          stop();
+          return true;
         }
         job.inputTokens += result.inputTokens;
         job.outputTokens += result.outputTokens;
@@ -485,19 +521,14 @@ export async function startEnrichment(
         } catch {
           parsed = { ok: false, error: "结果不是 JSON" };
         }
-        if ("ok" in parsed && job.requests < job.maxRequests && !opts.signal?.aborted) {
+        if ("ok" in parsed && job.requests < job.maxRequests && !signal.aborted) {
           job.requests += 1;
-          const retry = await complete({
-            system: SYSTEM,
-            user: `${user}\n上次结果无效：${parsed.error}。请只返回合法 JSON。`,
-            maxTokens: config.enrich.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-            timeoutMs: config.enrich.timeoutMs,
-            signal: opts.signal,
-          });
-          if (opts.signal?.aborted) {
+          const retry = await callModel(`${user}\n上次结果无效：${parsed.error}。请只返回合法 JSON。`);
+          if (signal.aborted) {
             chunk.status = "pending";
-            job.paused = true;
-            break;
+            chunk.error = undefined;
+            stop();
+            return true;
           }
           job.inputTokens += retry.inputTokens;
           job.outputTokens += retry.outputTokens;
@@ -517,25 +548,21 @@ export async function startEnrichment(
           chunk.output = parsed;
         }
       } catch (err) {
-        if (opts.signal?.aborted) {
+        if (signal.aborted) {
           chunk.status = "pending";
           chunk.error = undefined;
-          job.paused = true;
-          break;
+        } else {
+          chunk.status = "failed";
+          chunk.error = err instanceof Error ? err.message : "调用失败";
+          job.costUnknown = true;
         }
-        chunk.status = "failed";
-        chunk.error = err instanceof Error ? err.message : "调用失败";
-        job.costUnknown = true;
-        job.paused = true;
-        break;
+        stop();
       }
-      await saveJob(sourcePath, job);
-      progress();
-      if (opts.signal?.aborted) {
-        job.paused = true;
-        break;
-      }
-    }
+      await persist();
+      const running = job.chunks.filter((c) => c.status === "running").length;
+      progress(running > 1 ? `并行 ${running}` : undefined);
+      return true;
+    });
 
     job.records = materializeRecords(job, docs, config.enrich);
     await publishDerivedNotes(sourcePath, sourceKey, job.records, docs);

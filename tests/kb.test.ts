@@ -157,6 +157,17 @@ describe("config", () => {
     if (!off.ok) return;
     assert.equal(off.enabled, false);
     assert.equal(parseConfigJson({ roots: [{ name: "n", path: "/x" }], enabled: "no" }).ok, false);
+    assert.equal(parseConfigJson({
+      roots: [{ name: "n", path: "/x" }],
+      enrich: { provider: "openai", model: "m", concurrency: 0 },
+    }).ok, false);
+    const conc = parseConfigJson({
+      roots: [{ name: "n", path: "/x" }],
+      enrich: { provider: "openai", model: "m", concurrency: 8 },
+    });
+    assert.equal(conc.ok, true);
+    if (!conc.ok) return;
+    assert.equal(conc.enrich?.concurrency, 8);
   });
 
   it("plugin switch persists, blocks search, and restores", async () => {
@@ -211,6 +222,30 @@ describe("config", () => {
     assert.equal(hit.ok, true);
     if (!hit.ok) return;
     assert.equal(hit.hits.length, 1);
+  });
+
+  it("settings menu writes concurrency and timeout", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await mkdir(notes);
+    const configPath = join(dir, "pi-kb.json");
+    const enrich = { provider: "openai", model: "gpt-4.1-mini", maxOutputTokens: 2048, timeoutMs: 60_000 };
+    const saved = await saveConfigFile(configPath, [{ name: "notes", path: notes }], undefined, enrich);
+    assert.equal(saved.ok, true);
+    if (!saved.ok) return;
+    const selects = ["settings", "concurrency", "timeout"];
+    const inputs = ["4", "30"];
+    const loaded = await configureKbInteractive(configPath, {
+      select: async () => selects.shift(),
+      input: async () => inputs.shift(),
+      confirm: async () => false,
+      notify() {},
+    });
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    assert.equal(loaded.enrich?.concurrency, 4);
+    assert.equal(loaded.enrich?.timeoutMs, 30_000);
+    assert.equal(loaded.enrich?.model, "gpt-4.1-mini");
   });
 
   it("hasProjectDocs follows isolation bindings, not shared-only", async () => {

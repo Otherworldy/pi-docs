@@ -23,6 +23,7 @@ const enrich: EnrichSettings = {
   model: "fake",
   maxOutputTokens: 256,
   timeoutMs: 5000,
+  concurrency: 1,
 };
 
 describe("semantic", () => {
@@ -232,6 +233,48 @@ describe("semantic", () => {
     assert.equal(calls, 2);
     await startEnrichment(switched, "notes", complete, { mode: "full" });
     assert.equal(calls, 4);
+  });
+
+  it("runs pending chunks concurrently", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-kb-sem-conc-"));
+    const notes = join(dir, "notes");
+    await write(join(notes, "a.md"), "alpha-token\n");
+    await write(join(notes, "b.md"), "beta-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    await writeFile(configPath, JSON.stringify({
+      roots: [{ name: "notes", path: notes }],
+      enrich: { ...enrich, concurrency: 2 },
+    }));
+    const loaded = await loadConfigFile(configPath);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    let inflight = 0;
+    let maxInflight = 0;
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const complete: ModelComplete = async ({ user }) => {
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      if (inflight >= 2) release();
+      await hold;
+      inflight -= 1;
+      const token = user.includes("beta-token") ? "beta-token" : "alpha-token";
+      return {
+        text: JSON.stringify({
+          summary: token,
+          topics: [token],
+          aliases: [],
+          questions: [],
+          rules: [{ text: token, startLine: 1, endLine: 1, excerpt: token }],
+        }),
+        inputTokens: 1,
+        outputTokens: 1,
+      };
+    };
+    await startEnrichment(loaded, "notes", complete);
+    assert.equal(maxInflight, 2);
   });
 
   it("enriches a writable vault", async () => {

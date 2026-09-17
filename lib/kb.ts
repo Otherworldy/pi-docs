@@ -119,6 +119,8 @@ export const SNAPSHOT_MAX = 32 * 1024 * 1024;
 
 export const DEFAULT_MAX_OUTPUT_TOKENS = 2048;
 export const DEFAULT_TIMEOUT_MS = 60_000;
+export const DEFAULT_CONCURRENCY = 8;
+export const MAX_CONCURRENCY = 32;
 
 export type RootInput = {
   name: string;
@@ -168,6 +170,7 @@ export type EnrichSettings = {
   model: string;
   maxOutputTokens: number;
   timeoutMs: number;
+  concurrency?: number;
 };
 
 export type ConfigSpec = {
@@ -335,11 +338,16 @@ export function parseEnrichSettings(raw: unknown): EnrichSettings | Fail | undef
   if (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 300_000) {
     return { ok: false, error: "enrich.timeoutMs 无效" };
   }
+  const concurrency = rec.concurrency === undefined ? undefined : rec.concurrency;
+  if (concurrency !== undefined && (typeof concurrency !== "number" || !Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32)) {
+    return { ok: false, error: "enrich.concurrency 无效" };
+  }
   return {
     provider: rec.provider.trim(),
     model: rec.model.trim(),
     maxOutputTokens,
     timeoutMs,
+    ...(concurrency !== undefined ? { concurrency } : {}),
   };
 }
 
@@ -1846,6 +1854,68 @@ async function runKbMenu(
     ui.notify(await hooks.start(saved, rootName, mode));
   }
 
+  async function ensureEnrich(): Promise<EnrichSettings | undefined> {
+    if (config.ok && config.enrich) return config.enrich;
+    if (!hooks) {
+      ui.notify("当前环境不能调用清洗模型", "error");
+      return;
+    }
+    const model = await hooks.resolveModel(config.ok ? config.enrich : undefined, ui);
+    if (!model) return;
+    if ("ok" in model) {
+      ui.notify(model.error, "error");
+      return;
+    }
+    const saved = await saveConfigFile(configPath, snapshotRoots(config), home, model);
+    config = saved;
+    if (!saved.ok) {
+      ui.notify(saved.error, "error");
+      return;
+    }
+    return saved.enrich;
+  }
+
+  async function saveEnrich(next: EnrichSettings): Promise<void> {
+    const saved = await saveConfigFile(configPath, snapshotRoots(config), home, next);
+    config = saved;
+    ui.notify(saved.ok ? "已保存" : saved.error, saved.ok ? "info" : "error");
+  }
+
+  async function settingsMenu() {
+    for (;;) {
+      const enrich = config.ok ? config.enrich : undefined;
+      const conc = enrich?.concurrency ?? DEFAULT_CONCURRENCY;
+      const timeoutSec = Math.round((enrich?.timeoutMs ?? DEFAULT_TIMEOUT_MS) / 1000);
+      const act = await ui.select("设置", [
+        { value: "concurrency", label: "并发", description: `${conc} 路，同时整理几篇` },
+        { value: "timeout", label: "超时", description: `${timeoutSec} 秒，单次模型请求` },
+      ]);
+      if (!act) return;
+      const base = await ensureEnrich();
+      if (!base) continue;
+      if (act === "concurrency") {
+        const raw = (await ui.input("并发", String(conc)))?.trim();
+        if (!raw) continue;
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 1 || n > MAX_CONCURRENCY) {
+          ui.notify(`并发必须是 1–${MAX_CONCURRENCY} 的整数`, "error");
+          continue;
+        }
+        await saveEnrich({ ...base, concurrency: n });
+      } else if (act === "timeout") {
+        const raw = (await ui.input("超时秒数", String(timeoutSec)))?.trim();
+        if (!raw) continue;
+        const sec = Number(raw);
+        const ms = sec * 1000;
+        if (!Number.isInteger(sec) || ms < 1000 || ms > 300_000) {
+          ui.notify("超时必须是 1–300 的整数秒", "error");
+          continue;
+        }
+        await saveEnrich({ ...base, timeoutMs: ms });
+      }
+    }
+  }
+
   async function aiMenu(rootName: string) {
     for (;;) {
       let progress = "没有进行中的任务";
@@ -1993,6 +2063,7 @@ async function runKbMenu(
       description: r.writable ? `${r.path}  ·记录` : r.path,
     }));
     topOpts.push({ value: "add", label: "添加文档", description: "加入一个笔记目录，不改原文件" });
+    topOpts.push({ value: "settings", label: "设置", description: "清洗并发和超时" });
     topOpts.push({ value: "off", label: "关闭插件", description: "停止检索和写入，目录配置保留" });
     const top = await ui.select("知识库", topOpts);
     if (!top) {
@@ -2006,6 +2077,7 @@ async function runKbMenu(
       continue;
     }
     if (top === "add") await addDoc();
+    else if (top === "settings") await settingsMenu();
     else if (top.startsWith("root:")) await docMenu(top.slice(5));
   }
 }
