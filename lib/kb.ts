@@ -61,8 +61,20 @@ import {
   skipScan,
   walkTextFiles,
 } from "./collect.mjs";
-import { readGeneration, readTopManifest } from "./index-store.mjs";
+import { listDocs, readGeneration, readTopManifest } from "./index-store.mjs";
 import { searchRootIndex } from "./retrieval.mjs";
+import {
+  CONFIG_VERSION,
+  RESERVED_PROJECT_IDS,
+  findBindingConflicts,
+  findWorkspaceConflicts,
+  matchWorkspace,
+  ownershipForDoc,
+  parseIsolationFields,
+  parseScope,
+  scopeToJson,
+  visibleInQuery,
+} from "./scope.mjs";
 
 export {
   CACHE_DIRNAME,
@@ -114,11 +126,55 @@ export type RootInput = {
   exclude?: string[];
 };
 
+export type Scope =
+  | { kind: "shared" }
+  | { kind: "unassigned" }
+  | { kind: "projects"; projects: string[] };
+
+export type ProjectInput = {
+  id: string;
+  name: string;
+  workspaces: string[];
+};
+
+export type BindingInput = {
+  root: string;
+  path: string;
+  scope: Scope;
+};
+
+export type LoadedWorkspace = {
+  configuredPath: string;
+  path: string;
+  realPath?: string;
+  exists: boolean;
+};
+
+export type LoadedProject = {
+  id: string;
+  name: string;
+  workspaces: LoadedWorkspace[];
+};
+
+export type LoadedBinding = {
+  root: string;
+  path: string;
+  scope: Scope;
+};
+
 export type EnrichSettings = {
   provider: string;
   model: string;
   maxOutputTokens: number;
   timeoutMs: number;
+};
+
+export type ConfigSpec = {
+  isolation: boolean;
+  roots: RootInput[];
+  projects: ProjectInput[];
+  bindings: BindingInput[];
+  enrich?: EnrichSettings;
 };
 
 export type LoadedRoot = {
@@ -134,7 +190,10 @@ export type LoadedRoot = {
 export type LoadedConfig = {
   ok: true;
   configPath: string;
+  isolation: boolean;
   roots: LoadedRoot[];
+  projects: LoadedProject[];
+  bindings: LoadedBinding[];
   writable?: LoadedRoot;
   enrich?: EnrichSettings;
 } | {
@@ -148,6 +207,7 @@ export type ReadRef = {
   sourcePath: string;
   sourceHash: string;
   sourceTitle: string;
+  fp?: string;
 };
 
 export type Snippet = { line: number; text: string };
@@ -168,6 +228,9 @@ export type SearchHit = {
   semanticMatch?: boolean;
   semanticEvidence?: string;
   partial?: boolean;
+  scopeKind?: "shared" | "unassigned" | "projects";
+  projects?: string[];
+  scope?: Scope;
 };
 
 export type SearchOk = {
@@ -277,40 +340,56 @@ export function parseEnrichSettings(raw: unknown): EnrichSettings | Fail | undef
   };
 }
 
-export function parseConfigJson(raw: unknown): { ok: true; roots: RootInput[]; enrich?: EnrichSettings } | Fail {
+export function parseConfigJson(raw: unknown): ({ ok: true } & ConfigSpec) | Fail {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "配置必须是对象" };
-  const roots = (raw as { roots?: unknown }).roots;
+  const rec = raw as Record<string, unknown>;
+  const roots = rec.roots;
   if (!Array.isArray(roots)) return { ok: false, error: "缺少 roots 数组" };
   const names = new Set<string>();
   let writable = 0;
   const out: RootInput[] = [];
   for (const item of roots) {
     if (!item || typeof item !== "object" || Array.isArray(item)) return { ok: false, error: "root 必须是对象" };
-    const rec = item as Record<string, unknown>;
-    if (typeof rec.name !== "string" || !rec.name.trim()) return { ok: false, error: "root.name 不能为空" };
-    if (typeof rec.path !== "string" || !rec.path.trim()) return { ok: false, error: "root.path 不能为空" };
-    if (names.has(rec.name)) return { ok: false, error: `重复的 root 名: ${rec.name}` };
-    names.add(rec.name);
-    const isWritable = rec.writable === true;
+    const root = item as Record<string, unknown>;
+    if (typeof root.name !== "string" || !root.name.trim()) return { ok: false, error: "root.name 不能为空" };
+    if (typeof root.path !== "string" || !root.path.trim()) return { ok: false, error: "root.path 不能为空" };
+    if (names.has(root.name)) return { ok: false, error: `重复的 root 名: ${root.name}` };
+    names.add(root.name);
+    const isWritable = root.writable === true;
     if (isWritable) writable += 1;
     if (writable > 1) return { ok: false, error: "初版只允许一个可写 root" };
-    if (rec.exclude !== undefined) {
-      if (!Array.isArray(rec.exclude) || rec.exclude.some((x) => typeof x !== "string")) {
+    if (root.exclude !== undefined) {
+      if (!Array.isArray(root.exclude) || root.exclude.some((x) => typeof x !== "string")) {
         return { ok: false, error: "exclude 必须是字符串数组" };
       }
     }
-    const path = rec.path.trim();
-    if (!path.startsWith("~") && !isAbsolute(path)) return { ok: false, error: `root.path 必须是绝对路径或 ~/：${rec.name}` };
+    const path = root.path.trim();
+    if (!path.startsWith("~") && !isAbsolute(path)) return { ok: false, error: `root.path 必须是绝对路径或 ~/：${root.name}` };
     out.push({
-      name: rec.name.trim(),
+      name: root.name.trim(),
       path,
       writable: isWritable,
-      exclude: (rec.exclude as string[] | undefined) ?? [],
+      exclude: (root.exclude as string[] | undefined) ?? [],
     });
   }
-  const enrich = parseEnrichSettings((raw as { enrich?: unknown }).enrich);
+  const enrich = parseEnrichSettings(rec.enrich);
   if (enrich && "ok" in enrich) return enrich;
-  return { ok: true, roots: out, enrich };
+  if (rec.version === undefined) {
+    if (rec.projects !== undefined || rec.bindings !== undefined) {
+      return { ok: false, error: "projects/bindings 需要 version: 2" };
+    }
+    return { ok: true, isolation: false, roots: out, projects: [], bindings: [], enrich };
+  }
+  const iso = parseIsolationFields(rec, names);
+  if (!iso.ok) return iso;
+  return {
+    ok: true,
+    isolation: true,
+    roots: out,
+    projects: iso.projects,
+    bindings: iso.bindings,
+    enrich,
+  };
 }
 
 export async function loadConfigFile(configPath: string, home = homedir()): Promise<LoadedConfig> {
@@ -353,10 +432,42 @@ export async function loadConfigFile(configPath: string, home = homedir()): Prom
     }
     roots.push(loaded);
   }
+  const projects: LoadedProject[] = [];
+  for (const item of spec.projects) {
+    const workspaces: LoadedWorkspace[] = [];
+    for (const ws of item.workspaces) {
+      const expanded = resolve(expandUserPath(ws, home));
+      const loaded: LoadedWorkspace = {
+        configuredPath: ws,
+        path: expanded,
+        exists: false,
+      };
+      try {
+        const st = await lstat(expanded);
+        if (st.isSymbolicLink() || st.isDirectory()) {
+          loaded.realPath = await realpath(expanded);
+          loaded.exists = true;
+        }
+      } catch {
+        loaded.exists = false;
+      }
+      workspaces.push(loaded);
+    }
+    projects.push({ id: item.id, name: item.name, workspaces });
+  }
+  if (spec.isolation) {
+    const wsConflict = findWorkspaceConflicts(projects);
+    if (wsConflict) return { ok: false, configPath, error: wsConflict };
+    const bindConflict = findBindingConflicts(roots, spec.bindings);
+    if (bindConflict) return { ok: false, configPath, error: bindConflict };
+  }
   return {
     ok: true,
     configPath,
+    isolation: spec.isolation,
     roots,
+    projects,
+    bindings: spec.bindings,
     writable: roots.find((r) => r.writable),
     enrich: spec.enrich,
   };
@@ -417,7 +528,12 @@ type NoteMeta = {
   sourceHash?: string;
   sourceTitle?: string;
   coverage?: string;
+  scope?: Scope;
 };
+
+type AllowDoc = (file: string, doc?: { kind?: SearchHit["kind"]; sourcePath?: string; scope?: Scope }) => boolean;
+
+const allowAll: AllowDoc = () => true;
 
 const META_RE = /^<!-- pi-kb\n([\s\S]*?)\n-->\n?/;
 
@@ -441,6 +557,9 @@ export function parseNoteMeta(text: string): NoteMeta | null {
       meta.sourceHash = raw.sourceHash;
       meta.sourceTitle = typeof raw.sourceTitle === "string" ? raw.sourceTitle : "";
       meta.coverage = "full-text";
+    } else if (raw.scope !== undefined) {
+      const parsed = parseScope(raw.scope);
+      if (parsed.ok) meta.scope = parsed.scope;
     }
     return meta;
   } catch {
@@ -593,6 +712,7 @@ async function searchLayer(
   terms: string[],
   kindHint: "ai" | "original",
   b: Budget,
+  allow: AllowDoc = allowAll,
 ): Promise<SearchHit[]> {
   const hits: SearchHit[] = [];
   const seen = new Set<string>();
@@ -614,6 +734,7 @@ async function searchLayer(
       let extra = "";
       let sourcePath: string | undefined;
       let sourceStatus: SearchHit["sourceStatus"];
+      let noteScope: Scope | undefined;
       if (kindHint === "ai") {
         const meta = parseNoteMeta(got.text);
         if (meta?.type === "digest") {
@@ -628,10 +749,12 @@ async function searchLayer(
           }
         } else if (meta?.type === "lesson") {
           kind = "lesson";
+          noteScope = meta.scope;
         } else {
           kind = "lesson";
         }
       }
+      if (!allow(realPath, { kind, sourcePath, scope: noteScope })) return;
       const matched = matchFile(terms, relPath, got.text, extra);
       if (!matched) return;
       hits.push({
@@ -645,6 +768,7 @@ async function searchLayer(
         snippets: matched.snippets,
         preview: matched.preview,
         pathScore: matched.pathScore,
+        scope: noteScope,
       });
     });
   }
@@ -697,10 +821,11 @@ function semanticEvidence(rec: SemanticIndex, terms: string[]): string | undefin
   return hit?.slice(0, SNIPPET_MAX);
 }
 
-function hitsFromPrepared(snapshot: PreparedSnapshot, terms: string[], rootName: string, records: SemanticIndex[] = []): SearchHit[] {
+function hitsFromPrepared(snapshot: PreparedSnapshot, terms: string[], rootName: string, records: SemanticIndex[] = [], allow: AllowDoc = allowAll): SearchHit[] {
   const byPath = new Map(records.map((r) => [pathKey(r.path), r]));
   const hits: SearchHit[] = [];
   for (const doc of snapshot.docs) {
+    if (!allow(doc.path, { kind: "original" })) continue;
     const rec = byPath.get(pathKey(doc.path));
     const usable = rec && rec.sourceHash === doc.sourceHash ? rec : undefined;
     const titleExtra = `${doc.title}\n${doc.catalog.join(" / ")}`;
@@ -788,11 +913,12 @@ function mergeHits(hits: SearchHit[]): SearchHit[] {
   return [...merged.values()].sort((a, b) => b.pathScore - a.pathScore || a.path.localeCompare(b.path));
 }
 
-async function semanticHits(root: LoadedRoot, terms: string[]): Promise<SearchHit[]> {
+async function semanticHits(root: LoadedRoot, terms: string[], allow: AllowDoc = allowAll): Promise<SearchHit[]> {
   if (!root.realPath) return [];
   const recs = await loadSemanticIndex(root.realPath);
   const hits: SearchHit[] = [];
   for (const rec of recs) {
+    if (!allow(rec.path, { kind: "original" })) continue;
     const extra = semanticExtra(rec);
     const hay = foldSpace(extra).toLowerCase();
     if (!terms.every((t) => hayHas(hay, t))) continue;
@@ -826,6 +952,8 @@ async function hitsFromIndexedRoot(
   b: Budget,
   signal?: AbortSignal,
   retried = false,
+  allow: AllowDoc = allowAll,
+  isolation = false,
 ): Promise<SearchHit[] | Fail> {
   if (!root.realPath) return [];
   const indexOpts = {
@@ -836,7 +964,20 @@ async function hitsFromIndexedRoot(
     signal,
     scanMs: 8000,
   };
-  let found = await searchRootIndex(root.realPath, query, { limit });
+  const indexQuery: { limit: number; visibleIds?: Set<string>; generation?: number } = { limit };
+  async function scopedQuery() {
+    if (!isolation || !root.realPath) return indexQuery;
+    const listed = await listDocs(root.realPath);
+    if (!listed.ok) return listed;
+    const ids = new Set<string>();
+    for (const [id, doc] of listed.docs) {
+      if (allow(join(root.realPath, doc.relPath), doc)) ids.add(id);
+    }
+    return { limit, visibleIds: ids, generation: listed.generation };
+  }
+  let queryOpts = await scopedQuery();
+  if ("ok" in queryOpts && queryOpts.ok === false) return queryOpts;
+  let found = await searchRootIndex(root.realPath, query, queryOpts);
   if (!found.ok) return found;
   if (!found.indexed) {
     const built = await indexRoot(indexOpts);
@@ -846,13 +987,17 @@ async function hitsFromIndexedRoot(
         if (b.reasons.length < 8 && !b.reasons.includes(reason)) b.reasons.push(reason);
       }
     }
-    found = await searchRootIndex(root.realPath, query, { limit });
+    queryOpts = await scopedQuery();
+    if ("ok" in queryOpts && queryOpts.ok === false) return queryOpts;
+    found = await searchRootIndex(root.realPath, query, queryOpts);
     if (!found.ok) return found;
   }
   if (!found.indexed) return [];
   const merged = new Map<string, SearchHit>();
   for (const row of found.hits) {
     const abs = join(root.realPath, row.relPath);
+    const kind = row.kind === "digest" || row.kind === "lesson" || row.kind === "derived" ? row.kind : "original";
+    if (!allow(abs, { kind, sourcePath: row.sourcePath, scope: row.scope })) continue;
     let buf: Buffer;
     try {
       buf = await readFile(abs);
@@ -892,6 +1037,7 @@ async function hitsFromIndexedRoot(
       preview,
       pathScore: row.score ?? 0,
       partial: row.partial || undefined,
+      scope: row.scope,
     };
     const key = hit.kind === "lesson" ? `lesson:${pathKey(abs)}` : pathKey(hit.sourcePath ?? abs);
     const prev = merged.get(key);
@@ -914,7 +1060,7 @@ async function hitsFromIndexedRoot(
   const out = [...merged.values()].sort((a, b) => b.pathScore - a.pathScore || a.path.localeCompare(b.path)).slice(0, limit);
   if (!out.length && found.hits.length && !retried) {
     await indexRoot(indexOpts);
-    return hitsFromIndexedRoot(config, root, query, limit, b, signal, true);
+    return hitsFromIndexedRoot(config, root, query, limit, b, signal, true, allow, isolation);
   }
   return out;
 }
@@ -922,7 +1068,7 @@ async function hitsFromIndexedRoot(
 export async function searchKb(
   config: LoadedConfig,
   query: string,
-  opts: { root?: string; limit?: number; signal?: AbortSignal } = {},
+  opts: { root?: string; limit?: number; signal?: AbortSignal; projectIds?: string[] } = {},
 ): Promise<SearchOk | Fail> {
   if (!config.ok) return { ok: false, error: config.error };
   const terms = tokenizeQuery(query);
@@ -930,27 +1076,43 @@ export async function searchKb(
   const limit = Math.min(MAX_LIMIT, Math.max(1, opts.limit ?? DEFAULT_LIMIT));
   const b = newBudget(opts.signal);
   const writable = config.writable;
+  const scope = { isolation: config.isolation, projectIds: opts.projectIds ?? [] };
+  const allow: AllowDoc = (file, doc) => {
+    if (!scope.isolation) return true;
+    return visibleInQuery(ownershipForDoc(file, config.roots, config.bindings, doc), scope);
+  };
+
+  function tagHits(hits: SearchHit[]): SearchHit[] {
+    if (!scope.isolation) return hits;
+    for (const hit of hits) {
+      const file = (hit.kind === "digest" || hit.kind === "derived") ? (hit.sourcePath ?? hit.path) : hit.path;
+      const own = ownershipForDoc(file, config.roots, config.bindings, { kind: hit.kind, sourcePath: hit.sourcePath, scope: hit.scope });
+      hit.scopeKind = own.kind;
+      if (own.projects.length) hit.projects = own.projects;
+    }
+    return hits;
+  }
 
   async function fallbackRoot(root: LoadedRoot): Promise<SearchHit[] | Fail> {
-    const aiHits = root.writable ? await searchLayer(config, [root], [], terms, "ai", b) : [];
+    const aiHits = root.writable ? await searchLayer(config, [root], [], terms, "ai", b, allow) : [];
     const prepared = await prepareReadonlyRoot(config, root, { signal: opts.signal });
     if (!prepared.ok) return prepared;
     mergeSkip(b, prepared.snapshot);
-    const origHits = hitsFromPrepared(prepared.snapshot, terms, root.name, await loadSemanticIndex(prepared.snapshot.sourcePath));
+    const origHits = hitsFromPrepared(prepared.snapshot, terms, root.name, await loadSemanticIndex(prepared.snapshot.sourcePath), allow);
     return [...aiHits, ...origHits];
   }
 
   async function searchRoot(root: LoadedRoot): Promise<SearchHit[] | Fail> {
-    const indexed = await hitsFromIndexedRoot(config, root, query, limit, b, opts.signal);
+    const indexed = await hitsFromIndexedRoot(config, root, query, limit, b, opts.signal, false, allow, scope.isolation);
     if (!Array.isArray(indexed)) return indexed;
     const top = root.realPath ? await readTopManifest(root.realPath) : undefined;
     const hits = indexed.length ? indexed : (top?.current ? indexed : await fallbackRoot(root));
     if (!Array.isArray(hits)) return hits;
     if (root.realPath) {
-      const semantic = await semanticHits(root, terms, query);
-      return mergeHits([...hits, ...semantic]);
+      const semantic = await semanticHits(root, terms, allow);
+      return tagHits(mergeHits([...hits, ...semantic]));
     }
-    return hits;
+    return tagHits(hits);
   }
 
   if (opts.root) {
@@ -1012,6 +1174,9 @@ export function formatSearch(result: SearchOk): string {
     lines.push("", `## ${hit.kind}  root=${hit.root}${status}`);
     if (hit.title) lines.push(`标题: ${hit.title}${hit.catalog?.length ? `  ${hit.catalog.join(" / ")}` : ""}`);
     lines.push(hit.path);
+    if (hit.scopeKind === "shared") lines.push("归属: 共享");
+    else if (hit.scopeKind === "projects" && hit.projects?.length) lines.push(`归属: ${hit.projects.join(", ")}`);
+    else if (hit.scopeKind === "unassigned") lines.push("归属: 未分类");
     if (hit.sourcePath) lines.push(`来源: ${hit.sourcePath}`);
     if (hit.pathHit) lines.push(`文件名/路径命中${hit.preview ? `: ${hit.preview}` : ""}`);
     if (hit.partial) lines.push("部分匹配");
@@ -1109,12 +1274,37 @@ export async function existingDigestPath(
   }
 }
 
+export function inQueryScope(
+  config: Extract<LoadedConfig, { ok: true }>,
+  file: string,
+  projectIds: string[] = [],
+  doc?: { kind?: SearchHit["kind"]; sourcePath?: string; scope?: Scope },
+): boolean {
+  if (!config.isolation) return true;
+  return visibleInQuery(ownershipForDoc(file, config.roots, config.bindings, doc), {
+    isolation: true,
+    projectIds,
+  });
+}
+
+export function scopeFingerprint(config: LoadedConfig, projectIds: string[] = []): string {
+  if (!config.ok) return `err:${config.error}`;
+  return JSON.stringify({
+    i: config.isolation,
+    p: projectIds,
+    b: config.bindings,
+    proj: config.projects.map((p) => p.id),
+    ex: config.roots.map((r) => [r.name, r.exclude]),
+  });
+}
+
 export async function writeLesson(
   config: LoadedConfig,
-  input: { title: string; body: string; cwd: string; now?: Date },
+  input: { title: string; body: string; cwd: string; now?: Date; projectId?: string },
 ): Promise<WriteOk | Fail> {
   if (!config.ok) return { ok: false, error: config.error };
   if (!config.writable) return { ok: false, error: "未配置记录目录" };
+  if (config.isolation && !input.projectId) return { ok: false, error: "未选择项目，无法记录经验" };
   const bad = validateTitleBody(input.title, input.body);
   if (bad) return bad;
   const dir = join(await ensureWritableDir(config.writable), "lessons");
@@ -1123,12 +1313,13 @@ export async function writeLesson(
   if (!pathInside(dirReal, config.writable.realPath!)) return { ok: false, error: "lessons 目录逃出可写 root" };
   const day = (input.now ?? new Date()).toISOString().slice(0, 10);
   const fileName = `${day}-${randomUUID()}.md`;
-  const meta = {
+  const meta: Record<string, unknown> = {
     type: "lesson",
     createdAt: (input.now ?? new Date()).toISOString(),
     author: AUTHOR,
     cwd: input.cwd,
   };
+  if (input.projectId) meta.scope = { projects: [input.projectId] };
   const published = await publishFile(dirReal, fileName, formatNote(meta, input.title.trim(), input.body), "lesson", "retry");
   if (published.ok && config.ok) await refreshWritableIndex(config);
   return published;
@@ -1147,7 +1338,7 @@ async function refreshWritableIndex(config: Extract<LoadedConfig, { ok: true }>)
 
 export async function writeDigest(
   config: LoadedConfig,
-  input: { title: string; body: string; cwd: string; ref: ReadRef; now?: Date },
+  input: { title: string; body: string; cwd: string; ref: ReadRef; now?: Date; projectIds?: string[] },
 ): Promise<WriteOk | Fail> {
   if (!config.ok) return { ok: false, error: config.error };
   if (!config.writable) return { ok: false, error: "未配置记录目录" };
@@ -1160,6 +1351,9 @@ export async function writeDigest(
     return { ok: false, error: "来源已消失，请重读后再整理" };
   }
   if (coveredAndExcluded(sourceReal, config.roots) || !mostSpecificRoot(sourceReal, config.roots)) {
+    return { ok: false, error: "来源不在当前允许范围内" };
+  }
+  if (config.isolation && !inQueryScope(config, sourceReal, input.projectIds ?? [])) {
     return { ok: false, error: "来源不在当前允许范围内" };
   }
   if (config.writable.realPath && pathInside(sourceReal, config.writable.realPath)) {
@@ -1203,6 +1397,7 @@ export async function formatStatus(config: LoadedConfig): Promise<string> {
     return lines.join("\n");
   }
   lines.push("策略: 联合检索原文与 AI 笔记；完整读原文后可整理；不改原笔记");
+  lines.push(config.isolation ? `项目隔离: ${config.projects.length} 个项目` : "项目隔离: 未启用");
   lines.push(`格式: ${[...TEXT_EXTS].join(" ")}`);
   if (config.enrich) lines.push(`清洗模型: ${config.enrich.provider}/${config.enrich.model}`);
   else lines.push("清洗模型: 未配置（导入时可选择）");
@@ -1244,16 +1439,18 @@ export type RootChange =
   | { op: "remove"; name: string }
   | { op: "setWritable"; name: string };
 
+export type KbSelectOption = string | { value: string; label?: string; description?: string };
+
 export type KbUi = {
-  select(title: string, options: string[]): Promise<string | undefined>;
+  select(title: string, options: KbSelectOption[]): Promise<string | undefined>;
   input(title: string, placeholder?: string): Promise<string | undefined>;
   confirm(title: string, message: string): Promise<boolean>;
   notify(text: string, level?: "info" | "warning" | "error"): void;
 };
 
 export type EnrichHooks = {
-  resolveModel(current?: EnrichSettings): Promise<EnrichSettings | Fail | undefined>;
-  start(config: Extract<LoadedConfig, { ok: true }>, rootName: string): Promise<string>;
+  resolveModel(current?: EnrichSettings, ui?: KbUi): Promise<EnrichSettings | Fail | undefined>;
+  start(config: Extract<LoadedConfig, { ok: true }>, rootName: string, mode?: "full" | "incremental"): Promise<string>;
   pause?(rootName: string): Promise<string>;
 };
 
@@ -1265,6 +1462,130 @@ export function snapshotRoots(config: LoadedConfig): RootInput[] {
     writable: r.writable,
     exclude: [...r.exclude],
   }));
+}
+
+export type ProjectSession = {
+  mode: "auto" | "id" | "shared";
+  projectId?: string;
+  extraIds: string[];
+};
+
+export function applyProjectArg(config: LoadedConfig, raw: string): ({ ok: true } & Pick<ProjectSession, "mode" | "projectId">) | Fail {
+  const token = raw.trim();
+  if (!token) return { ok: false, error: "缺少项目参数" };
+  if (!config.ok) return { ok: false, error: config.error };
+  if (!config.isolation) return { ok: false, error: "未启用项目隔离" };
+  if (token === "auto") return { ok: true, mode: "auto" };
+  if (token === "shared") return { ok: true, mode: "shared" };
+  if (!config.projects.some((p) => p.id === token)) return { ok: false, error: `没有这个项目: ${token}` };
+  return { ok: true, mode: "id", projectId: token };
+}
+
+export function applyScopeArg(config: LoadedConfig, raw: string): { ok: true; extraIds: string[] } | Fail {
+  const token = raw.trim();
+  if (!token) return { ok: false, error: "缺少范围参数" };
+  if (!config.ok) return { ok: false, error: config.error };
+  if (!config.isolation) return { ok: false, error: "未启用项目隔离" };
+  if (token === "current") return { ok: true, extraIds: [] };
+  if (token === "all") return { ok: true, extraIds: ["*"] };
+  const ids = token.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+  for (const id of ids) {
+    if (id === "*" || id === "all" || id === "current") return { ok: false, error: `无效项目 id: ${id}` };
+    if (!config.projects.some((p) => p.id === id)) return { ok: false, error: `没有这个项目: ${id}` };
+  }
+  return { ok: true, extraIds: ids };
+}
+
+export async function backupConfigFile(configPath: string): Promise<{ ok: true; path?: string; existed?: boolean } | Fail> {
+  const dest = `${configPath}.bak`;
+  try {
+    await copyFile(configPath, dest, constants.COPYFILE_EXCL);
+    return { ok: true, path: dest };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { ok: true };
+    if (code === "EEXIST") return { ok: true, path: dest, existed: true };
+    return { ok: false, error: `无法备份配置: ${code ?? "unknown"}` };
+  }
+}
+
+function newProjectId(name: string, used: Set<string>): string {
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  let id = slug && !RESERVED_PROJECT_IDS.has(slug) ? slug : `p-${randomUUID().slice(0, 8)}`;
+  if (!used.has(id)) return id;
+  return `p-${randomUUID().slice(0, 8)}`;
+}
+
+export function currentProjectId(config: LoadedConfig, cwd: string, session?: ProjectSession): string | undefined {
+  if (!config.ok || !config.isolation) return;
+  if (session?.mode === "id") return session.projectId;
+  if (session?.mode === "shared") return;
+  const matched = matchWorkspace(cwd, config.projects);
+  return matched.ok ? matched.projectId : undefined;
+}
+
+async function bindDocumentToProject(
+  config: LoadedConfig,
+  rootName: string,
+  workspacePath: string,
+  configPath: string,
+  home: string,
+): Promise<{ iso: { projects: ProjectInput[]; bindings: BindingInput[] } } | Fail> {
+  const ws = resolve(expandUserPath(workspacePath.trim(), home));
+  if (!ws) return { ok: false, error: "项目地址不能为空" };
+  const isolated = config.ok && config.isolation;
+  if (!isolated) {
+    const bak = await backupConfigFile(configPath);
+    if (!bak.ok) return bak;
+  }
+  const iso = snapshotIsolation(config) ?? { projects: [], bindings: [] };
+  let proj = iso.projects.find((p) => p.workspaces.some((w) => samePath(w, ws)));
+  if (!proj) {
+    const name = basename(ws) || "project";
+    const id = newProjectId(name, new Set(iso.projects.map((p) => p.id)));
+    proj = { id, name, workspaces: [ws] };
+    iso.projects.push(proj);
+  }
+  const existing = iso.bindings.find((b) => b.root === rootName && b.path === ".");
+  if (existing?.scope.kind === "projects") {
+    if (!existing.scope.projects.includes(proj.id)) existing.scope.projects.push(proj.id);
+  } else {
+    iso.bindings = iso.bindings.filter((b) => !(b.root === rootName && b.path === "."));
+    iso.bindings.push({ root: rootName, path: ".", scope: { kind: "projects", projects: [proj.id] } });
+  }
+  return { iso };
+}
+
+async function bindDocumentShared(
+  config: LoadedConfig,
+  rootName: string,
+  configPath: string,
+): Promise<{ iso: { projects: ProjectInput[]; bindings: BindingInput[] } } | Fail> {
+  const isolated = config.ok && config.isolation;
+  if (!isolated) {
+    const bak = await backupConfigFile(configPath);
+    if (!bak.ok) return bak;
+  }
+  const iso = snapshotIsolation(config) ?? { projects: [], bindings: [] };
+  iso.bindings = iso.bindings.filter((b) => !(b.root === rootName && b.path === "."));
+  iso.bindings.push({ root: rootName, path: ".", scope: { kind: "shared" } });
+  return { iso };
+}
+
+export function snapshotIsolation(config: LoadedConfig): { projects: ProjectInput[]; bindings: BindingInput[] } | undefined {
+  if (!config.ok || !config.isolation) return;
+  return {
+    projects: config.projects.map((p) => ({
+      id: p.id,
+      name: p.name,
+      workspaces: p.workspaces.map((w) => w.configuredPath),
+    })),
+    bindings: config.bindings.map((b) => ({
+      root: b.root,
+      path: b.path,
+      scope: b.scope,
+    })),
+  };
 }
 
 export function applyRootChange(roots: RootInput[], change: RootChange): { ok: true; roots: RootInput[] } | Fail {
@@ -1295,17 +1616,40 @@ export async function saveConfigFile(
   roots: RootInput[],
   home = homedir(),
   enrich?: EnrichSettings | null,
+  isolation?: { projects: ProjectInput[]; bindings: BindingInput[] } | null,
 ): Promise<LoadedConfig> {
   let nextEnrich = enrich;
-  if (nextEnrich === undefined) {
+  let nextIso = isolation;
+  if (nextEnrich === undefined || nextIso === undefined) {
     const existing = await loadConfigFile(configPath, home);
-    if (existing.ok) nextEnrich = existing.enrich;
-  } else if (nextEnrich === null) {
-    nextEnrich = undefined;
+    if (existing.ok) {
+      if (nextEnrich === undefined) nextEnrich = existing.enrich;
+      if (nextIso === undefined) nextIso = snapshotIsolation(existing) ?? null;
+    } else if (nextIso === undefined) {
+      nextIso = null;
+    }
   }
-  const spec = parseConfigJson({ roots, enrich: nextEnrich });
+  if (nextEnrich === null) nextEnrich = undefined;
+  if (nextIso) {
+    const names = new Set(roots.map((r) => r.name));
+    nextIso = {
+      projects: nextIso.projects,
+      bindings: nextIso.bindings.filter((b) => names.has(b.root)),
+    };
+  }
+  const raw: Record<string, unknown> = { roots, enrich: nextEnrich };
+  if (nextIso) {
+    raw.version = CONFIG_VERSION;
+    raw.projects = nextIso.projects;
+    raw.bindings = nextIso.bindings.map((b) => ({
+      root: b.root,
+      path: b.path,
+      scope: scopeToJson(b.scope),
+    }));
+  }
+  const spec = parseConfigJson(raw);
   if (!spec.ok) return { ok: false, configPath, error: spec.error };
-  const payload: { roots: RootInput[]; enrich?: EnrichSettings } = {
+  const payload: Record<string, unknown> = {
     roots: spec.roots.map((r) => {
       const o: RootInput = {
         name: r.name,
@@ -1316,6 +1660,15 @@ export async function saveConfigFile(
       return o;
     }),
   };
+  if (spec.isolation) {
+    payload.version = CONFIG_VERSION;
+    payload.projects = spec.projects;
+    payload.bindings = spec.bindings.map((b) => ({
+      root: b.root,
+      path: b.path,
+      scope: scopeToJson(b.scope),
+    }));
+  }
   if (spec.enrich) payload.enrich = spec.enrich;
   const body = `${JSON.stringify(payload, null, 2)}\n`;
   await mkdir(dirname(configPath), { recursive: true });
@@ -1347,16 +1700,13 @@ function scheduleIndex(
     skipInside: skipInsidePaths(root.realPath, config.writable?.realPath, root.writable),
     exclude: root.exclude,
     mode,
-  });
+  }).catch(() => {});
 }
 
 async function afterAddReadonly(
   config: Extract<LoadedConfig, { ok: true }>,
   name: string,
   ui: KbUi,
-  hooks: EnrichHooks | undefined,
-  configPath: string,
-  home: string,
 ): Promise<LoadedConfig> {
   const root = config.roots.find((r) => r.name === name);
   if (!root) return config;
@@ -1373,22 +1723,199 @@ async function afterAddReadonly(
   const extra = prepared.persistError ? `；${prepared.persistError}` : "";
   ui.notify(`规则清洗完成：${prepared.processed} 篇${extra}`);
   scheduleIndex(config, root);
-  if (!hooks) return config;
-  const useAi = await ui.confirm("使用 AI 全量语义整理？", `${name} 共 ${prepared.processed} 篇。仅规则清洗也可搜索。`);
-  if (!useAi) return config;
-  const model = await hooks.resolveModel(config.enrich);
-  if (!model) return config;
-  if ("ok" in model) {
-    ui.notify(model.error, "error");
-    return config;
+  return config;
+}
+
+async function runKbMenu(
+  config: LoadedConfig,
+  configPath: string,
+  ui: KbUi,
+  home: string,
+  hooks: EnrichHooks | undefined,
+  sessionOpts?: { cwd?: string; session?: ProjectSession; persistSession?: (s: ProjectSession) => void },
+): Promise<LoadedConfig> {
+  const cwd = sessionOpts?.cwd ?? process.cwd();
+
+  async function addDoc() {
+    const name = (await ui.input("名称"))?.trim();
+    if (!name) return;
+    const path = (await ui.input("路径"))?.trim();
+    if (!path) return;
+    const roots = snapshotRoots(config);
+    let writable = false;
+    if (!roots.some((r) => r.writable)) {
+      writable = await ui.confirm("作为记录目录？", "kb_write 会写入此目录下的 digests/ 和 lessons/");
+    }
+    const applied = applyRootChange(roots, { op: "add", name, path, writable });
+    if (!applied.ok) {
+      ui.notify(applied.error, "error");
+      return;
+    }
+    const saved = await saveConfigFile(configPath, applied.roots, home);
+    if (!saved.ok) {
+      ui.notify(saved.error, "error");
+      return;
+    }
+    config = saved;
+    const raw = await ui.input("项目地址", cwd);
+    const scoped = raw === undefined || !raw.trim()
+      ? await bindDocumentShared(config, name, configPath)
+      : await bindDocumentToProject(config, name, raw, configPath, home);
+    if ("error" in scoped) {
+      ui.notify(scoped.error, "error");
+    } else {
+      const bound = await saveConfigFile(configPath, snapshotRoots(config), home, undefined, scoped.iso);
+      config = bound;
+      ui.notify(bound.ok ? "已保存" : bound.error, bound.ok ? "info" : "error");
+    }
+    if (config.ok) config = await afterAddReadonly(config, name, ui);
   }
-  const saved = await saveConfigFile(configPath, snapshotRoots(config), home, model);
-  if (!saved.ok) {
-    ui.notify(saved.error, "error");
-    return config;
+
+  async function startAi(rootName: string, mode: "full" | "incremental") {
+    if (!config.ok) return;
+    if (!hooks) {
+      ui.notify("当前环境不能调用清洗模型", "error");
+      return;
+    }
+    const model = await hooks.resolveModel(config.enrich, ui);
+    if (!model) return;
+    if ("ok" in model) {
+      ui.notify(model.error, "error");
+      return;
+    }
+    const saved = await saveConfigFile(configPath, snapshotRoots(config), home, model);
+    if (!saved.ok) {
+      ui.notify(saved.error, "error");
+      return;
+    }
+    config = saved;
+    ui.notify(await hooks.start(saved, rootName, mode));
   }
-  ui.notify(await hooks.start(saved, name));
-  return saved;
+
+  async function aiMenu(rootName: string) {
+    for (;;) {
+      let progress = "没有进行中的任务";
+      if (config.ok) {
+        const root = config.roots.find((r) => r.name === rootName);
+        if (root?.realPath) {
+          const { loadJob, jobSummary } = await import("./semantic.ts");
+          const job = await loadJob(root.realPath);
+          if (job) progress = jobSummary(job);
+        }
+      }
+      const act = await ui.select("AI整理", [
+        { value: "start", label: "开始", description: "全量重跑清洗" },
+        { value: "incr", label: "增量整理", description: "只处理新增和变更" },
+        { value: "stop", label: "停止", description: progress },
+      ]);
+      if (!act) return;
+      if (act === "start") await startAi(rootName, "full");
+      else if (act === "incr") await startAi(rootName, "incremental");
+      else ui.notify(hooks?.pause ? await hooks.pause(rootName) : progress);
+    }
+  }
+
+  async function scopeMenu(rootName: string) {
+    for (;;) {
+      const bind = config.ok ? config.bindings.find((b) => b.root === rootName && b.path === ".") : undefined;
+      const ids = bind?.scope.kind === "projects" ? bind.scope.projects : [];
+      const opts: KbSelectOption[] = ids.map((id) => {
+        const proj = config.ok ? config.projects.find((p) => p.id === id) : undefined;
+        const path = proj?.workspaces[0]?.configuredPath ?? id;
+        return { value: `proj:${id}`, label: proj?.name ?? id, description: path };
+      });
+      opts.push({ value: "add", label: "添加", description: "填写项目目录路径" });
+      const picked = await ui.select("归属", opts);
+      if (!picked) return;
+      if (picked === "add") {
+        const raw = await ui.input("项目地址", cwd);
+        if (raw === undefined) continue;
+        const ws = raw.trim();
+        if (!ws) {
+          ui.notify("项目地址不能为空", "error");
+          continue;
+        }
+        const scoped = await bindDocumentToProject(config, rootName, ws, configPath, home);
+        if ("error" in scoped) {
+          ui.notify(scoped.error, "error");
+          continue;
+        }
+        const saved = await saveConfigFile(configPath, snapshotRoots(config), home, undefined, scoped.iso);
+        config = saved;
+        ui.notify(saved.ok ? "已保存归属" : saved.error, saved.ok ? "info" : "error");
+        continue;
+      }
+      const id = picked.startsWith("proj:") ? picked.slice(5) : picked;
+      const proj = config.ok ? config.projects.find((p) => p.id === id) : undefined;
+      const path = proj?.workspaces[0]?.configuredPath ?? id;
+      const del = await ui.select(proj?.name ?? id, [
+        { value: "delete", label: "删除", description: path },
+      ]);
+      if (del !== "delete" || !config.ok) continue;
+      const iso = snapshotIsolation(config);
+      if (!iso) continue;
+      const cur = iso.bindings.find((b) => b.root === rootName && b.path === ".");
+      if (cur?.scope.kind === "projects") {
+        cur.scope.projects = cur.scope.projects.filter((p) => p !== id);
+        if (!cur.scope.projects.length) {
+          iso.bindings = iso.bindings.filter((b) => b !== cur);
+        }
+      }
+      const saved = await saveConfigFile(configPath, snapshotRoots(config), home, undefined, iso);
+      config = saved;
+      ui.notify(saved.ok ? "已删除归属" : saved.error, saved.ok ? "info" : "error");
+    }
+  }
+
+  async function docMenu(rootName: string) {
+    for (;;) {
+      const root = snapshotRoots(config).find((r) => r.name === rootName);
+      if (!root) return;
+      const act = await ui.select(rootName, [
+        { value: "delete", label: "删除", description: "只去掉配置，不删磁盘文件" },
+        { value: "ai", label: "AI整理", description: "用清洗模型生成检索资料" },
+        { value: "scope", label: "归属", description: "这份资料给哪些项目用" },
+      ]);
+      if (!act) return;
+      if (act === "ai") {
+        await aiMenu(rootName);
+        continue;
+      }
+      if (act === "scope") {
+        await scopeMenu(rootName);
+        continue;
+      }
+      if (act === "delete") {
+        if (!await ui.confirm("删除这个文档配置？", rootName)) continue;
+        const applied = applyRootChange(snapshotRoots(config), { op: "remove", name: rootName });
+        if (!applied.ok) {
+          ui.notify(applied.error, "error");
+          continue;
+        }
+        const saved = await saveConfigFile(configPath, applied.roots, home);
+        config = saved;
+        ui.notify(saved.ok ? "已保存" : saved.error, saved.ok ? "info" : "error");
+        return;
+      }
+    }
+  }
+
+  for (;;) {
+    const roots = snapshotRoots(config);
+    const topOpts: KbSelectOption[] = roots.map((r) => ({
+      value: `root:${r.name}`,
+      label: r.name,
+      description: r.writable ? `${r.path}  ·记录` : r.path,
+    }));
+    topOpts.push({ value: "add", label: "添加文档", description: "加入一个笔记目录，不改原文件" });
+    const top = await ui.select("知识库", topOpts);
+    if (!top) {
+      ui.notify(await formatStatus(config));
+      return config;
+    }
+    if (top === "add") await addDoc();
+    else if (top.startsWith("root:")) await docMenu(top.slice(5));
+  }
 }
 
 export async function configureKbInteractive(
@@ -1396,6 +1923,7 @@ export async function configureKbInteractive(
   ui: KbUi,
   home = homedir(),
   hooks?: EnrichHooks,
+  sessionOpts?: { cwd?: string; session?: ProjectSession; persistSession?: (s: ProjectSession) => void },
 ): Promise<LoadedConfig> {
   let config = await loadConfigFile(configPath, home);
   if (!config.ok && !config.error.includes("不存在")) {
@@ -1405,90 +1933,7 @@ export async function configureKbInteractive(
       return config;
     }
   }
-  for (;;) {
-    const roots = snapshotRoots(config);
-    const options = ["完成", "添加目录"];
-    if (roots.length) options.push("删除目录", "设为记录目录", "刷新资料", "AI 整理", "暂停 AI");
-    const choice = await ui.select(await formatStatus(config), options);
-    if (!choice || choice === "完成") {
-      ui.notify(await formatStatus(config));
-      return config;
-    }
-    if (choice === "刷新资料" || choice === "AI 整理" || choice === "暂停 AI") {
-      if (!config.ok) continue;
-      const names = config.roots.map((r) => r.name);
-      if (choice === "刷新资料") {
-        const name = await ui.select("刷新哪个目录？", names);
-        if (!name) continue;
-        const root = config.roots.find((r) => r.name === name);
-        if (!root) continue;
-        const prepared = await prepareReadonlyRoot(config, root);
-        if (prepared.ok) scheduleIndex(config, root, "full");
-        ui.notify(prepared.ok ? `已刷新 ${name}：${prepared.processed} 篇 ${prepared.status}` : prepared.error, prepared.ok ? "info" : "error");
-        continue;
-      }
-      if (choice === "AI 整理") {
-        if (!hooks) {
-          ui.notify("当前环境不能调用清洗模型", "error");
-          continue;
-        }
-        const name = await ui.select("整理哪个目录？", names);
-        if (!name) continue;
-        const model = await hooks.resolveModel(config.enrich);
-        if (!model) continue;
-        if ("ok" in model) {
-          ui.notify(model.error, "error");
-          continue;
-        }
-        const savedModel = await saveConfigFile(configPath, snapshotRoots(config), home, model);
-        if (!savedModel.ok) {
-          ui.notify(savedModel.error, "error");
-          continue;
-        }
-        config = savedModel;
-        ui.notify(await hooks.start(savedModel, name));
-        return savedModel;
-      }
-      const name = await ui.select("暂停哪个目录？", names);
-      if (!name) continue;
-      ui.notify(hooks?.pause ? await hooks.pause(name) : "没有进行中的任务");
-      continue;
-    }
-    let change: RootChange | undefined;
-    if (choice === "添加目录") {
-      const name = (await ui.input("目录名称", roots.length ? "agent" : "obsidian"))?.trim();
-      if (!name) continue;
-      const path = (await ui.input("绝对路径或 ~/", "~/"))?.trim();
-      if (!path) continue;
-      let writable = false;
-      if (!roots.some((r) => r.writable)) {
-        writable = await ui.confirm("作为记录目录？", "kb_write 会写入此目录下的 digests/ 和 lessons/");
-      }
-      change = { op: "add", name, path, writable };
-    } else if (choice === "删除目录") {
-      const name = await ui.select("删除哪个目录？", roots.map((r) => r.name));
-      if (!name) continue;
-      if (!await ui.confirm("删除这个目录配置？", name)) continue;
-      change = { op: "remove", name };
-    } else if (choice === "设为记录目录") {
-      const name = await ui.select("哪个目录用于写入？", roots.map((r) => r.name));
-      if (!name) continue;
-      change = { op: "setWritable", name };
-    } else {
-      continue;
-    }
-    const applied = applyRootChange(roots, change);
-    if (!applied.ok) {
-      ui.notify(applied.error, "error");
-      continue;
-    }
-    const saved = await saveConfigFile(configPath, applied.roots, home);
-    config = saved;
-    ui.notify(saved.ok ? "已保存" : saved.error, saved.ok ? "info" : "error");
-    if (saved.ok && change.op === "add") {
-      config = await afterAddReadonly(saved, change.name, ui, hooks, configPath, home);
-    }
-  }
+  return runKbMenu(config, configPath, ui, home, hooks, sessionOpts);
 }
 
 export function isOriginalTextFile(config: Extract<LoadedConfig, { ok: true }>, realPath: string): boolean {

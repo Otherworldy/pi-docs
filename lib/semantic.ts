@@ -423,7 +423,7 @@ export async function startEnrichment(
   config: Extract<LoadedConfig, { ok: true }>,
   rootName: string,
   complete: ModelComplete,
-  opts: { signal?: AbortSignal; maxRequests?: number; onProgress?: (text: string) => void } = {},
+  opts: { signal?: AbortSignal; maxRequests?: number; onProgress?: (text: string) => void; mode?: "full" | "incremental" } = {},
 ): Promise<string> {
   if (!config.enrich) return "未配置清洗模型";
   const root = config.roots.find((r) => r.name === rootName);
@@ -435,7 +435,8 @@ export async function startEnrichment(
   const lock = await acquireLock(sourcePath);
   if (!lock.ok) return lock.error;
   try {
-    let job = reuseChunks(await loadJob(sourcePath), buildJob(prepared.snapshot, config.enrich, opts.maxRequests));
+    const built = buildJob(prepared.snapshot, config.enrich, opts.maxRequests);
+    let job = opts.mode === "full" ? built : reuseChunks(await loadJob(sourcePath), built);
     job.paused = false;
     const docs = new Map(prepared.snapshot.docs.map((d) => [pathKey(d.path), d]));
     const progress = (title?: string) => opts.onProgress?.(jobSummary(job, title));

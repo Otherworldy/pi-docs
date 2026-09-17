@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -12,6 +12,7 @@ import {
   getDocs,
   getPostings,
   listDocIds,
+  listDocs,
   manifestPath,
   processAlive,
   readGeneration,
@@ -19,6 +20,7 @@ import {
   releaseIndexLock,
   stageIndex,
 } from "../lib/index-store.mjs";
+import { searchRootIndex } from "../lib/retrieval.mjs";
 
 async function vault() {
   const dir = await mkdtemp(join(tmpdir(), "pi-kb-idx-"));
@@ -92,6 +94,33 @@ describe("index store", () => {
     assert.equal(terms.ok, true);
     assert.equal(terms.terms.get("constructor")?.df, 1);
     assert.equal(terms.terms.get("toString")?.postings[0].docId, d.docId);
+  });
+
+  it("updates docs when a term record has no postings array", async () => {
+    const { source, sourceKey } = await vault();
+    const d = doc(sourceKey, "a.md", { title: "hello" });
+    const first = await commitIndex(source, {
+      sourceKey,
+      upserts: [{ doc: d, postings: [{ term: "hello", tf: 1, fields: ["title"], lines: [1] }] }],
+    });
+    assert.equal(first.ok, true);
+    const termDir = join(source, ".pi-kb/index/terms");
+    for (const name of await readdir(termDir)) {
+      if (!name.endsWith(".json")) continue;
+      const p = join(termDir, name);
+      const raw = JSON.parse(await readFile(p, "utf8"));
+      if (!raw.terms) continue;
+      for (const rec of Object.values(raw.terms) as { postings?: unknown }[]) delete rec.postings;
+      await writeFile(p, `${JSON.stringify(raw)}\n`);
+    }
+    const second = await commitIndex(source, {
+      sourceKey,
+      upserts: [{ doc: d, postings: [{ term: "hello", tf: 1, fields: ["title"], lines: [1] }] }],
+    });
+    assert.equal(second.ok, true);
+    const terms = await getPostings(source, ["hello"]);
+    assert.equal(terms.ok, true);
+    assert.equal(terms.ok && terms.terms.get("hello")?.df, 1);
   });
 
   it("updates terms, deletes docs, and reuses unchanged shards", async () => {
@@ -189,5 +218,56 @@ describe("index store", () => {
     const recovered = await acquireIndexLock(source);
     assert.equal(recovered.ok, true);
     await releaseIndexLock(source, recovered.token);
+  });
+
+  it("reads a pinned previous generation", async () => {
+    const { source, sourceKey } = await vault();
+    const a = doc(sourceKey, "a.md", { title: "old", sourceHash: "h1" });
+    await commitIndex(source, {
+      sourceKey,
+      upserts: [{ doc: a, postings: [{ term: "old", tf: 1, fields: ["body"], lines: [1] }] }],
+    });
+    const first = await readTopManifest(source);
+    await commitIndex(source, {
+      sourceKey,
+      upserts: [{
+        doc: { ...a, title: "new", sourceHash: "h2" },
+        postings: [{ term: "new", tf: 1, fields: ["body"], lines: [1] }],
+      }],
+    });
+    const pinned = await getDocs(source, [a.docId], first!.current);
+    assert.equal(pinned.ok, true);
+    assert.equal(pinned.generation, first!.current);
+    assert.equal(pinned.docs.get(a.docId)?.title, "old");
+    const listed = await listDocs(source, first!.current);
+    assert.equal(listed.docs.get(a.docId)?.title, "old");
+  });
+
+  it("scoped search does not let other docs fill candidates", async () => {
+    const { source, sourceKey } = await vault();
+    const upserts = [];
+    for (let i = 0; i < 200; i++) {
+      const rel = `b/${i}.md`;
+      upserts.push({
+        doc: doc(sourceKey, rel, { title: `B${i}`, sourceHash: `b${i}` }),
+        postings: [{ term: "api", tf: 20, fields: ["body"], lines: [1] }],
+      });
+    }
+    const a = doc(sourceKey, "a/correct.md", { title: "A正确", sourceHash: "a1" });
+    upserts.push({
+      doc: a,
+      postings: [{ term: "api", tf: 1, fields: ["body"], lines: [1] }],
+    });
+    const committed = await commitIndex(source, { sourceKey, upserts });
+    assert.equal(committed.ok, true);
+    const open = await searchRootIndex(source, "api", { limit: 1 });
+    assert.equal(open.ok, true);
+    assert.notEqual(open.hits[0]?.docId, a.docId);
+    const scoped = await searchRootIndex(source, "api", { limit: 1, visibleIds: new Set([a.docId]) });
+    assert.equal(scoped.ok, true);
+    assert.equal(scoped.hits.length, 1);
+    assert.equal(scoped.hits[0].docId, a.docId);
+    assert.equal(scoped.nDocs, 1);
+    assert.equal(scoped.hits[0].relPath, "a/correct.md");
   });
 });

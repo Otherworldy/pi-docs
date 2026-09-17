@@ -27,7 +27,12 @@ import {
   writeDigest,
   writeLesson,
   type LoadedConfig,
+  type KbSelectOption,
 } from "../lib/kb.ts";
+
+function vals(options?: KbSelectOption[]) {
+  return (options ?? []).map((o) => typeof o === "string" ? o : o.value);
+}
 
 async function tmp() {
   return mkdtemp(join(tmpdir(), "pi-kb-"));
@@ -155,7 +160,7 @@ describe("config", () => {
 
     const other = join(dir, "other");
     await mkdir(other);
-    const selects = ["添加目录", "完成"];
+    const selects = ["add"];
     const inputs = ["docs", other];
     const ui = {
       select: async () => selects.shift(),
@@ -178,7 +183,7 @@ describe("config", () => {
     await write(join(notes, "a.md"), "hello-token\n");
     const configPath = join(dir, "pi-kb.json");
     let started = 0;
-    const selects = ["添加目录", "完成"];
+    const selects = ["add"];
     const inputs = ["notes", notes];
     const ui = {
       select: async () => selects.shift(),
@@ -204,6 +209,31 @@ describe("config", () => {
     assert.equal(r.hits.length, 1);
   });
 
+  it("skipping ownership on add marks the document shared", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    await mkdir(notes);
+    const configPath = join(dir, "pi-kb.json");
+    const selects = ["add"];
+    const inputs = ["notes", notes];
+    const placeholders: (string | undefined)[] = [];
+    const loaded = await configureKbInteractive(configPath, {
+      select: async () => selects.shift(),
+      input: async (_title: string, placeholder?: string) => {
+        placeholders.push(placeholder);
+        return inputs.shift();
+      },
+      confirm: async () => false,
+      notify() {},
+    }, undefined, undefined, { cwd: dir });
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    assert.equal(loaded.isolation, true);
+    assert.ok(loaded.bindings.some((b) => b.root === "notes" && b.path === "." && b.scope.kind === "shared"));
+    assert.deepEqual(placeholders.slice(0, 2), [undefined, undefined]);
+    assert.equal(placeholders[2], dir);
+  });
+
   it("record dir is prepared and listed for AI", async () => {
     const dir = await tmp();
     const notes = join(dir, "notes");
@@ -212,11 +242,11 @@ describe("config", () => {
     const configPath = join(dir, "pi-kb.json");
     const confirms = [true, false];
     let menu: string[] | undefined;
-    const selects = ["添加目录", "完成"];
+    const selects = ["add"];
     const inputs = ["notes", notes];
     const ui = {
-      select: async (_title: string, options?: string[]) => {
-        if (!menu && options?.includes("添加目录")) menu = options;
+      select: async (_title: string, options?: KbSelectOption[]) => {
+        if (!menu && vals(options).includes("add")) menu = vals(options);
         return selects.shift();
       },
       input: async () => inputs.shift(),
@@ -233,16 +263,17 @@ describe("config", () => {
     assert.equal(r.hits.length, 1);
     assert.equal(r.hits[0].kind, "original");
     const again = await configureKbInteractive(configPath, {
-      select: async (_title: string, options?: string[]) => {
-        menu = options;
-        return "完成";
+      select: async (_title: string, options?: KbSelectOption[]) => {
+        menu = vals(options);
+        return undefined;
       },
       input: async () => undefined,
       confirm: async () => false,
       notify() {},
     });
     assert.equal(again.ok, true);
-    assert.ok(menu?.includes("AI 整理"));
+    assert.ok(menu?.includes("add"));
+    assert.ok(menu?.includes("root:notes"));
   });
 
   it("formatStatus shows paused job progress", async () => {
@@ -713,5 +744,107 @@ describe("prepare", () => {
     assert.equal(digest.ok, true);
     if (!digest.ok) return;
     assert.ok(digest.hits.some((h) => h.kind === "lesson" && h.path.includes("digests")));
+  });
+});
+
+describe("isolation search", () => {
+  it("hides other projects and unscoped lessons; isolation off still sees all", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    const agent = join(notes, "agent");
+    await write(join(notes, "a/api.md"), "headerField 项目A专用\n");
+    await write(join(notes, "b/api.md"), "headerField 项目B专用\n");
+    await write(join(agent, "lessons/old.md"), `<!-- pi-kb\n${JSON.stringify({
+      type: "lesson",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      author: "pi-agent",
+      cwd: dir,
+    })}\n-->\n\n# 旧经验\n\nheaderField 无归属\n`);
+    const configPath = join(dir, "pi-kb.json");
+    const saved = await saveConfigFile(configPath, [
+      { name: "notes", path: notes },
+      { name: "agent", path: agent, writable: true },
+    ], undefined, undefined, {
+      projects: [
+        { id: "pa", name: "A", workspaces: [join(dir, "wa")] },
+        { id: "pb", name: "B", workspaces: [join(dir, "wb")] },
+      ],
+      bindings: [
+        { root: "notes", path: "a", scope: { kind: "projects", projects: ["pa"] } },
+        { root: "notes", path: "b", scope: { kind: "projects", projects: ["pb"] } },
+      ],
+    });
+    assert.equal(saved.ok, true);
+    if (!saved.ok) return;
+    const a = await searchKb(saved, "headerField", { projectIds: ["pa"] });
+    assert.equal(a.ok, true);
+    if (!a.ok) return;
+    assert.ok(a.hits.some((h) => h.path.includes(`${join("a", "api.md")}`) || h.relPath?.includes("a/api.md")));
+    assert.equal(a.hits.some((h) => /b\/api\.md|b\\api\.md/.test(h.path) || h.relPath === "b/api.md"), false);
+    assert.equal(a.hits.some((h) => h.kind === "lesson"), false);
+    const none = await searchKb(saved, "headerField", { projectIds: [] });
+    assert.equal(none.ok, true);
+    if (!none.ok) return;
+    assert.equal(none.hits.length, 0);
+    const legacy = await cfg(dir, [
+      { name: "notes", path: notes },
+      { name: "agent", path: agent, writable: true },
+    ]);
+    assert.equal(legacy.ok, true);
+    if (!legacy.ok) return;
+    const open = await searchKb(legacy, "headerField");
+    assert.equal(open.ok, true);
+    if (!open.ok) return;
+    assert.ok(open.hits.some((h) => h.relPath === "a/api.md" || h.path.endsWith("a/api.md")));
+    assert.ok(open.hits.some((h) => h.relPath === "b/api.md" || h.path.endsWith("b/api.md")));
+  });
+
+  it("writeLesson stores project scope; digest outside scope is rejected", async () => {
+    const dir = await tmp();
+    const notes = join(dir, "notes");
+    const agent = join(notes, "agent");
+    await write(join(notes, "a/api.md"), "headerField A\n");
+    await write(join(notes, "b/api.md"), "headerField B\n");
+    const configPath = join(dir, "pi-kb.json");
+    const saved = await saveConfigFile(configPath, [
+      { name: "notes", path: notes },
+      { name: "agent", path: agent, writable: true },
+    ], undefined, undefined, {
+      projects: [
+        { id: "pa", name: "A", workspaces: [join(dir, "wa")] },
+        { id: "pb", name: "B", workspaces: [join(dir, "wb")] },
+      ],
+      bindings: [
+        { root: "notes", path: "a", scope: { kind: "projects", projects: ["pa"] } },
+        { root: "notes", path: "b", scope: { kind: "projects", projects: ["pb"] } },
+      ],
+    });
+    assert.equal(saved.ok, true);
+    if (!saved.ok) return;
+    const lesson = await writeLesson(saved, { title: "坑", body: "headerField 项目A经验", cwd: dir, projectId: "pa" });
+    assert.equal(lesson.ok, true);
+    if (!lesson.ok) return;
+    const text = await readFile(lesson.path, "utf8");
+    assert.match(text, /"pa"/);
+    const found = await searchKb(saved, "项目A经验", { projectIds: ["pa"] });
+    assert.equal(found.ok, true);
+    if (!found.ok) return;
+    assert.ok(found.hits.some((h) => h.kind === "lesson"));
+    const hidden = await searchKb(saved, "项目A经验", { projectIds: ["pb"] });
+    assert.equal(hidden.ok, true);
+    if (!hidden.ok) return;
+    assert.equal(hidden.hits.some((h) => h.kind === "lesson"), false);
+    const missing = await writeLesson(saved, { title: "x", body: "no project", cwd: dir });
+    assert.equal(missing.ok, false);
+    const bPath = join(notes, "b/api.md");
+    const buf = await readFile(bPath);
+    const denied = await writeDigest(saved, {
+      title: "d",
+      body: "整理 B",
+      cwd: dir,
+      projectIds: ["pa"],
+      ref: { id: "r", sourcePath: bPath, sourceHash: sha256(buf), sourceTitle: "b" },
+    });
+    assert.equal(denied.ok, false);
   });
 });
