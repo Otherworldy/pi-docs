@@ -222,7 +222,6 @@ export function createKbExtension(opts: KbOptions = {}) {
       if (fp !== lastFp) {
         lastFp = fp;
         pending.clear();
-        refs.clear();
         prompted.clear();
       }
       return fp;
@@ -379,23 +378,20 @@ export function createKbExtension(opts: KbOptions = {}) {
         readRef: Type.Optional(Type.String({ description: "UUID from a complete built-in read footer, or that file's absolute path" })),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-        config = await loadConfigFile(opts.configPath ?? join(getAgentDir(), CONFIG_FILENAME), home);
         const title = String(params.title ?? "");
         const body = String(params.body ?? "");
         const cwd = ctx?.cwd ?? process.cwd();
-        const fp = bumpScope(cwd);
+        const ref = params.readRef ? await lookupRef(String(params.readRef), cwd) : undefined;
+        if (params.readRef && !ref) {
+          const hint = refs.size === 0
+            ? "本次还没有完整阅读原文。请用内置 read（不要带 offset，不要用 grep/bash）读完整文件，再把结果里的 readRef UUID 原样传入。"
+            : "无效或过期的 readRef。请原样复制 read 结果里的 UUID，或传入刚读过的原文路径。";
+          return { content: [{ type: "text" as const, text: hint }], isError: true };
+        }
+        config = await loadConfigFile(opts.configPath ?? join(getAgentDir(), CONFIG_FILENAME), home);
+        bumpScope(cwd);
         const ids = searchIds(cwd);
-        if (params.readRef) {
-          const ref = await lookupRef(String(params.readRef), cwd);
-          if (!ref) {
-            const hint = refs.size === 0
-              ? "本次还没有完整阅读原文。请用内置 read（不要带 offset，不要用 grep/bash）读完整文件，再把结果里的 readRef UUID 原样传入。"
-              : "无效或过期的 readRef。请原样复制 read 结果里的 UUID，或传入刚读过的原文路径。";
-            return { content: [{ type: "text" as const, text: hint }], isError: true };
-          }
-          if (ref.fp && ref.fp !== fp) {
-            return { content: [{ type: "text" as const, text: "阅读凭证已过期，请重新完整阅读原文。" }], isError: true };
-          }
+        if (ref) {
           const result = await writeDigest(config, { title, body, cwd, ref, projectIds: ids });
           if (!result.ok) return { content: [{ type: "text" as const, text: result.error }], isError: true };
           const extra = result.cleanupFailed ? "（已保存，临时文件清理失败）" : "";
@@ -521,8 +517,7 @@ export function createKbExtension(opts: KbOptions = {}) {
       if (!snap || !config.ok) return;
       if (event.isError) return;
       const cwd = ctx?.cwd ?? process.cwd();
-      const fp = bumpScope(cwd);
-      if (snap.fp !== fp) return;
+      bumpScope(cwd);
       if (!inQueryScope(config, snap.absPath, searchIds(cwd))) return;
       const text = textOf(event.content);
       if (isTruncatedReadResult(event.details, text, snap.offset)) return;
@@ -540,7 +535,7 @@ export function createKbExtension(opts: KbOptions = {}) {
         sourcePath: snap.absPath,
         sourceHash: hash,
         sourceTitle: sourceTitleFrom(snap.absPath, buf.toString("utf8")),
-        fp,
+        fp: snap.fp,
       };
       refs.set(id, ref);
       refs.set(pathKey(snap.absPath), ref);

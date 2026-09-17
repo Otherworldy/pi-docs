@@ -162,6 +162,34 @@ describe("pi extension", () => {
     assert.equal(afterReload.isError, true);
   });
 
+  it("kb_write keeps readRef after config reload changes the scope fingerprint", async () => {
+    const { dir, notes, agent, tools, handlers, src, body, ctx } = await setup();
+    const id = "call-keep-ref";
+    await handlers.tool_call({ toolName: "read", toolCallId: id, input: { path: src } }, ctx);
+    const full = await handlers.tool_result({
+      toolName: "read",
+      toolCallId: id,
+      isError: false,
+      content: [{ type: "text", text: body }],
+      details: {},
+    }, ctx);
+    const readRef = /readRef=([0-9a-f-]+)/.exec(full.content.at(-1).text)![1];
+    await writeFile(join(dir, "pi-kb.json"), JSON.stringify({
+      roots: [
+        { name: "notes", path: notes, exclude: ["tmp"] },
+        { name: "agent", path: agent, writable: true },
+      ],
+    }));
+    await tools.kb_search.execute("s", { query: "headerField" }, undefined, undefined, ctx);
+    const written = await tools.kb_write.execute("w-keep", {
+      title: "selectCompare",
+      body: "默认 headerField 是 person。",
+      readRef,
+    }, undefined, undefined, ctx);
+    assert.equal(written.isError, undefined);
+    assert.match(written.content[0].text, /digest/);
+  });
+
   it("complete read with limit and extra wrapper still issues readRef", async () => {
     const { tools, handlers, src, body, ctx } = await setup();
     const id = "call-limit";
