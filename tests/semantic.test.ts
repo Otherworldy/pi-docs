@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { describe, it } from "node:test";
 import { loadConfigFile, searchKb, type EnrichSettings } from "../lib/kb.ts";
 import {
@@ -231,6 +231,83 @@ describe("semantic", () => {
     assert.equal(calls, 2);
     await startEnrichment(switched, "notes", complete, { mode: "full" });
     assert.equal(calls, 4);
+  });
+
+  it("incremental reuses completed chunks after the directory is moved", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-kb-sem-move-"));
+    const notes = join(dir, "notes");
+    await write(join(notes, "sub/a.md"), "alpha-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    await writeFile(configPath, JSON.stringify({ roots: [{ name: "notes", path: notes }], enrich }));
+    const loaded = await loadConfigFile(configPath);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    let calls = 0;
+    const complete: ModelComplete = async () => {
+      calls += 1;
+      return {
+        text: JSON.stringify({
+          summary: "alpha-token",
+          topics: ["alpha-token"],
+          aliases: [],
+          questions: [],
+          rules: [{ text: "alpha-token", startLine: 1, endLine: 1, excerpt: "alpha-token" }],
+        }),
+        inputTokens: 1,
+        outputTokens: 1,
+      };
+    };
+    await startEnrichment(loaded, "notes", complete);
+    assert.equal(calls, 1);
+    const moved = join(dir, "moved");
+    await rename(notes, moved);
+    await writeFile(configPath, JSON.stringify({ roots: [{ name: "notes", path: moved }], enrich }));
+    const reloaded = await loadConfigFile(configPath);
+    assert.equal(reloaded.ok, true);
+    if (!reloaded.ok) return;
+    await startEnrichment(reloaded, "notes", complete, { mode: "incremental" });
+    assert.equal(calls, 1);
+    const job = await loadJob(moved);
+    assert.equal(job?.chunks[0]?.relPath, "sub/a.md");
+    assert.equal(job?.chunks[0]?.status, "completed");
+    assert.ok(job!.chunks[0]!.docPath.includes(`${sep}moved${sep}`));
+  });
+
+  it("incremental reuses old jobs that only stored absolute paths", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-kb-sem-oldkey-"));
+    const notes = join(dir, "notes");
+    await write(join(notes, "a.md"), "alpha-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    await writeFile(configPath, JSON.stringify({ roots: [{ name: "notes", path: notes }], enrich }));
+    const loaded = await loadConfigFile(configPath);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    let calls = 0;
+    const complete: ModelComplete = async () => {
+      calls += 1;
+      return {
+        text: JSON.stringify({
+          summary: "alpha-token",
+          topics: ["alpha-token"],
+          aliases: [],
+          questions: [],
+          rules: [{ text: "alpha-token", startLine: 1, endLine: 1, excerpt: "alpha-token" }],
+        }),
+        inputTokens: 1,
+        outputTokens: 1,
+      };
+    };
+    await startEnrichment(loaded, "notes", complete);
+    assert.equal(calls, 1);
+    const job = await loadJob(notes);
+    assert.ok(job);
+    job!.chunks = job!.chunks.map((c) => {
+      const { relPath: _drop, ...rest } = c as typeof c & { relPath?: string };
+      return { ...rest, docPath: join(dir, "old", "a.md"), relPath: undefined as unknown as string };
+    });
+    await writeFile(join(notes, ".pi-kb/job.json"), `${JSON.stringify(job)}\n`);
+    await startEnrichment(loaded, "notes", complete, { mode: "incremental" });
+    assert.equal(calls, 1);
   });
 
   it("runs pending chunks concurrently", async () => {

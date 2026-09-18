@@ -35,7 +35,7 @@ pi install /home/Node/pi-docs
 
 `path` 必须是绝对路径或 `~/`（Windows 可用 `C:\\Notes` 或 `C:/Notes`）。最多一个 `writable: true`（记录目录）：原文仍可检索、可签发 `readRef`；`kb_write` 只写入该目录下的 `digests/` 和 `lessons/`，不改原文。`exclude` 为相对该 root 的路径前缀，按路径段匹配。修改配置后 `/reload`。
 
-可选 `enrich` 指定独立的低价清洗模型（`provider`、`model`，以及可选的 `maxOutputTokens`、`timeoutMs`、`concurrency`、`retries`）。清洗默认 8 路并行（1–32）；超时/格式失败默认再打 2 次，仍失败则跳过该块。连续两块都是网络/超时失败则暂停整次；增量会重试失败块。改目录配置时会保留该字段。未配置时仍可只做规则清洗。
+可选 `enrich` 指定独立的低价清洗模型（`provider`、`model`，以及可选的 `maxOutputTokens`、`timeoutMs`、`concurrency`、`retries`）。清洗默认 8 路并行（1–32）；超时/格式失败默认再打 2 次，仍失败则跳过该块。连续两块都是网络/超时失败则暂停整次；增量会重试失败块。目录换路径再导入时，增量按相对路径+原文哈希复用已完成块。改目录配置时会保留该字段。未配置时仍可只做规则清洗。
 
 Windows：路径比较忽略大小写和斜杠方向；目录联接按符号链接跳过，不跟随。写入先尝试硬链接，失败则用 `COPYFILE_EXCL` 独占拷贝，不会覆盖已有笔记。
 

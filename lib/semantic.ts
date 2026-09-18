@@ -85,6 +85,7 @@ export type ChunkOutput = {
 
 export type JobChunk = {
   docPath: string;
+  relPath: string;
   sourceHash: string;
   index: number;
   startLine: number;
@@ -171,8 +172,12 @@ export function splitChunks(doc: PreparedDoc): { startLine: number; endLine: num
   return ranges;
 }
 
-function chunkKey(chunk: Pick<JobChunk, "docPath" | "sourceHash" | "index" | "startLine" | "endLine">): string {
-  return `${pathKey(chunk.docPath)}:${chunk.sourceHash}:${chunk.index}:${chunk.startLine}:${chunk.endLine}`;
+function chunkKey(chunk: Pick<JobChunk, "relPath" | "sourceHash" | "index" | "startLine" | "endLine">): string {
+  return `${chunk.relPath}:${chunk.sourceHash}:${chunk.index}:${chunk.startLine}:${chunk.endLine}`;
+}
+
+function hashKey(chunk: Pick<JobChunk, "sourceHash" | "index" | "startLine" | "endLine">): string {
+  return `${chunk.sourceHash}:${chunk.index}:${chunk.startLine}:${chunk.endLine}`;
 }
 
 export function buildJob(snapshot: PreparedSnapshot, enrich: EnrichSettings): EnrichJob {
@@ -182,6 +187,7 @@ export function buildJob(snapshot: PreparedSnapshot, enrich: EnrichSettings): En
     parts.forEach((part, index) => {
       chunks.push({
         docPath: doc.path,
+        relPath: doc.relPath,
         sourceHash: doc.sourceHash,
         index,
         startLine: part.startLine,
@@ -381,8 +387,21 @@ function mergeRecord(doc: PreparedDoc, enrich: EnrichSettings, parts: ReturnType
 function reuseChunks(prev: EnrichJob | undefined, next: EnrichJob): EnrichJob {
   if (!prev) return next;
   if (prev.promptVersion !== next.promptVersion) return next;
-  const done = new Map(prev.chunks.filter((c) => c.status === "completed").map((c) => [chunkKey(c), c]));
-  const records = prev.records.filter((r) => next.chunks.some((c) => pathKey(c.docPath) === pathKey(r.path) && c.sourceHash === r.sourceHash));
+  const done = new Map<string, JobChunk>();
+  const doneByHash = new Map<string, JobChunk>();
+  for (const c of prev.chunks) {
+    if (c.status !== "completed") continue;
+    if (c.relPath) done.set(chunkKey(c), c);
+    else doneByHash.set(hashKey(c), c);
+  }
+  const chunks = next.chunks.map((c) => {
+    const hit = (c.relPath ? done.get(chunkKey(c)) : undefined) ?? doneByHash.get(hashKey(c));
+    return hit ? { ...hit, docPath: c.docPath, relPath: c.relPath } : c;
+  });
+  const records = prev.records.flatMap((r) => {
+    const match = chunks.find((c) => c.sourceHash === r.sourceHash && c.status === "completed");
+    return match ? [{ ...r, path: match.docPath }] : [];
+  });
   return {
     ...next,
     requests: prev.requests,
@@ -390,7 +409,7 @@ function reuseChunks(prev: EnrichJob | undefined, next: EnrichJob): EnrichJob {
     outputTokens: prev.outputTokens,
     costUnknown: prev.costUnknown,
     records,
-    chunks: next.chunks.map((c) => done.get(chunkKey(c)) ?? c),
+    chunks,
   };
 }
 
