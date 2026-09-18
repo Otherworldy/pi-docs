@@ -30,6 +30,7 @@ import {
   sourceTitleFrom,
   inQueryScope,
   hasProjectDocs,
+  visibleRootCount,
   scopeFingerprint,
   writeDigest,
   writeLesson,
@@ -147,11 +148,11 @@ function enrichHooksFor(ctx: any, configPath: string, home: string, runs: Map<st
         signal: ac.signal,
         mode,
         onProgress(text) {
-          ctx.ui?.setStatus?.("pi-kb", text);
+          ctx.ui?.setStatus?.("pi-kb", ctx.ui.theme?.fg?.("muted", text) ?? text);
           ctx.ui?.notify?.(text);
         },
       }).then((summary) => {
-        ctx.ui?.setStatus?.("pi-kb", summary);
+        ctx.ui?.setStatus?.("pi-kb", ctx.ui.theme?.fg?.("muted", summary) ?? summary);
         ctx.ui?.notify?.(summary);
         return summary;
       }).catch((err) => {
@@ -247,14 +248,13 @@ export function createKbExtension(opts: KbOptions = {}) {
       return fp;
     }
 
-    function persistSession(piApi: ExtensionAPI, cwd: string, ui?: { setStatus?: (k: string, t: string | undefined) => void }) {
+    function persistSession(piApi: ExtensionAPI, cwd: string, ui?: { setStatus?: (k: string, t: string | undefined) => void; theme?: { fg?: (c: string, t: string) => string } }) {
       try {
         piApi.appendEntry?.("pi-kb-project", { mode: projectMode, projectId, extraIds });
       } catch { /* optional */ }
-      const ids = projectIdsFor(cwd);
-      const extra = extraIds.includes("*") ? "全部" : extraIds.length ? extraIds.join(",") : "当前";
-      const label = projectMode === "shared" ? "仅共享" : (ids[0] ?? "未识别");
-      ui?.setStatus?.("pi-kb-project", config.ok && config.isolation ? `项目:${label} 检索:${extra}` : undefined);
+      const n = offerKb(cwd) ? visibleRootCount(config, searchIds(cwd), { includeShared: true }) : 0;
+      const raw = config.ok ? `docs:${n}` : undefined;
+      ui?.setStatus?.("pi-kb-project", raw ? ui.theme?.fg?.("muted", raw) ?? raw : undefined);
     }
 
     function restoreSession(ctx: { sessionManager?: { getBranch?: () => any[] } }) {

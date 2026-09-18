@@ -1324,23 +1324,32 @@ function rootUsable(config: Extract<LoadedConfig, { ok: true }>, name: string): 
   return !!(root && (root.exists || root.writable));
 }
 
+export function visibleRootCount(
+  config: LoadedConfig,
+  projectIds: string[] = [],
+  opts: { includeShared?: boolean } = {},
+): number {
+  if (!config.ok || !config.enabled) return 0;
+  if (!config.isolation) return config.roots.filter((r) => r.exists || r.writable).length;
+  const ids = new Set(projectIds);
+  const names = new Set<string>();
+  for (const b of config.bindings) {
+    if (!rootUsable(config, b.root)) continue;
+    if (b.scope.kind === "shared") {
+      if (opts.includeShared) names.add(b.root);
+      continue;
+    }
+    if (ids.size && b.scope.kind === "projects" && b.scope.projects.some((id) => ids.has(id))) names.add(b.root);
+  }
+  return names.size;
+}
+
 export function hasProjectDocs(
   config: LoadedConfig,
   projectIds: string[] = [],
   opts: { includeShared?: boolean } = {},
 ): boolean {
-  if (!config.ok || !config.enabled) return false;
-  if (!config.isolation) return config.roots.some((r) => r.exists || r.writable);
-  if (opts.includeShared && config.bindings.some((b) => b.scope.kind === "shared" && rootUsable(config, b.root))) {
-    return true;
-  }
-  const ids = new Set(projectIds);
-  if (!ids.size) return false;
-  return config.bindings.some((b) => {
-    if (b.scope.kind !== "projects") return false;
-    if (!b.scope.projects.some((id) => ids.has(id))) return false;
-    return rootUsable(config, b.root);
-  });
+  return visibleRootCount(config, projectIds, opts) > 0;
 }
 
 export function scopeFingerprint(config: LoadedConfig, projectIds: string[] = []): string {

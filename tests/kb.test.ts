@@ -22,6 +22,7 @@ import {
   prepareReadonlyRoot,
   saveConfigFile,
   hasProjectDocs,
+  visibleRootCount,
   searchKb,
   sha256,
   sourceCachePath,
@@ -294,6 +295,11 @@ describe("config", () => {
     assert.equal(hasProjectDocs(legacy, []), true);
     const off = { ...saved, enabled: false };
     assert.equal(hasProjectDocs(off, ["pa"]), false);
+    assert.equal(visibleRootCount(saved, ["pa"]), 1);
+    assert.equal(visibleRootCount(saved, ["pb"]), 0);
+    assert.equal(visibleRootCount(shared, ["pa"], { includeShared: true }), 1);
+    assert.equal(visibleRootCount(legacy, []), 1);
+    assert.equal(visibleRootCount(off, ["pa"]), 0);
   });
 
   it("saveConfigFile round-trips and interactive add creates config", async () => {
