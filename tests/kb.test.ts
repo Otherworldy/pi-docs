@@ -168,6 +168,17 @@ describe("config", () => {
     assert.equal(conc.ok, true);
     if (!conc.ok) return;
     assert.equal(conc.enrich?.concurrency, 8);
+    assert.equal(parseConfigJson({
+      roots: [{ name: "n", path: "/x" }],
+      enrich: { provider: "openai", model: "m", retries: -1 },
+    }).ok, false);
+    const retried = parseConfigJson({
+      roots: [{ name: "n", path: "/x" }],
+      enrich: { provider: "openai", model: "m", retries: 2 },
+    });
+    assert.equal(retried.ok, true);
+    if (!retried.ok) return;
+    assert.equal(retried.enrich?.retries, 2);
   });
 
   it("plugin switch persists, blocks search, and restores", async () => {
@@ -224,7 +235,7 @@ describe("config", () => {
     assert.equal(hit.hits.length, 1);
   });
 
-  it("settings menu writes concurrency and timeout", async () => {
+  it("settings menu writes concurrency, timeout, and retries", async () => {
     const dir = await tmp();
     const notes = join(dir, "notes");
     await mkdir(notes);
@@ -233,8 +244,8 @@ describe("config", () => {
     const saved = await saveConfigFile(configPath, [{ name: "notes", path: notes }], undefined, enrich);
     assert.equal(saved.ok, true);
     if (!saved.ok) return;
-    const selects = ["settings", "concurrency", "timeout"];
-    const inputs = ["4", "30"];
+    const selects = ["settings", "concurrency", "timeout", "retries"];
+    const inputs = ["4", "30", "3"];
     const loaded = await configureKbInteractive(configPath, {
       select: async () => selects.shift(),
       input: async () => inputs.shift(),
@@ -245,6 +256,7 @@ describe("config", () => {
     if (!loaded.ok) return;
     assert.equal(loaded.enrich?.concurrency, 4);
     assert.equal(loaded.enrich?.timeoutMs, 30_000);
+    assert.equal(loaded.enrich?.retries, 3);
     assert.equal(loaded.enrich?.model, "gpt-4.1-mini");
   });
 
@@ -423,7 +435,6 @@ describe("config", () => {
       model: "fake",
       promptVersion: 1,
       chunkVersion: 1,
-      maxRequests: 10,
       requests: 4,
       inputTokens: 1,
       outputTokens: 1,

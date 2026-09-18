@@ -136,6 +136,7 @@ function enrichHooksFor(ctx: any, configPath: string, home: string, runs: Map<st
         maxOutputTokens: current?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
         timeoutMs: current?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         concurrency: current?.concurrency,
+        retries: current?.retries,
       };
     },
     async start(loaded, rootName, mode = "incremental") {

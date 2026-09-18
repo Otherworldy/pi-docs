@@ -24,6 +24,7 @@ const enrich: EnrichSettings = {
   maxOutputTokens: 256,
   timeoutMs: 5000,
   concurrency: 1,
+  retries: 1,
 };
 
 describe("semantic", () => {
@@ -145,7 +146,7 @@ describe("semantic", () => {
     assert.equal(stale.hits.length, 0);
   });
 
-  it("invalid json fails the chunk; resume does not recall completed chunks; budget pauses", async () => {
+  it("invalid json fails the chunk; resume does not recall completed chunks", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-kb-sem2-"));
     const notes = join(dir, "notes");
     await write(join(notes, "a.md"), "alpha-token\\n");
@@ -195,9 +196,6 @@ describe("semantic", () => {
     await startEnrichment(loaded, "notes", counting);
     assert.equal(seen.has("beta"), false);
     assert.ok(calls > after);
-
-    const paused = await startEnrichment(loaded, "notes", async () => ({ text: "x", inputTokens: 1, outputTokens: 1, costUnknown: true }), { maxRequests: 0 });
-    assert.match(paused, /部分完成|请求/);
   });
 
   it("incremental keeps completed chunks after the cleaning model changes", async () => {
@@ -275,6 +273,100 @@ describe("semantic", () => {
     };
     await startEnrichment(loaded, "notes", complete);
     assert.equal(maxInflight, 2);
+  });
+
+  it("retries then skips a thrown chunk without pausing the job", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-kb-sem-skip-"));
+    const notes = join(dir, "notes");
+    await write(join(notes, "a.md"), "alpha-token\n");
+    await write(join(notes, "b.md"), "beta-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    await writeFile(configPath, JSON.stringify({
+      roots: [{ name: "notes", path: notes }],
+      enrich: { ...enrich, retries: 2 },
+    }));
+    const loaded = await loadConfigFile(configPath);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    let calls = 0;
+    const complete: ModelComplete = async ({ user }) => {
+      calls += 1;
+      if (user.includes("alpha-token")) throw new Error("timeout");
+      return {
+        text: JSON.stringify({
+          summary: "beta-token",
+          topics: ["beta-token"],
+          aliases: [],
+          questions: [],
+          rules: [{ text: "beta-token", startLine: 1, endLine: 1, excerpt: "beta-token" }],
+        }),
+        inputTokens: 1,
+        outputTokens: 1,
+      };
+    };
+    const status = await startEnrichment(loaded, "notes", complete);
+    assert.match(status, /部分完成/);
+    assert.doesNotMatch(status, /已暂停/);
+    assert.equal(calls, 4);
+    const job = await loadJob(notes);
+    assert.ok(job);
+    assert.equal(job!.paused, false);
+    const alpha = job!.chunks.find((c) => c.docPath.endsWith("a.md"));
+    const beta = job!.chunks.find((c) => c.docPath.endsWith("b.md"));
+    assert.equal(alpha?.status, "failed");
+    assert.equal(alpha?.error, "timeout");
+    assert.equal(beta?.status, "completed");
+  });
+
+  it("pauses after consecutive throws; incremental retries failed chunks", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-kb-sem-pause-"));
+    const notes = join(dir, "notes");
+    await write(join(notes, "a.md"), "alpha-token\n");
+    await write(join(notes, "b.md"), "beta-token\n");
+    await write(join(notes, "c.md"), "gamma-token\n");
+    const configPath = join(dir, "pi-kb.json");
+    await writeFile(configPath, JSON.stringify({
+      roots: [{ name: "notes", path: notes }],
+      enrich: { ...enrich, retries: 0, concurrency: 1 },
+    }));
+    const loaded = await loadConfigFile(configPath);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    let calls = 0;
+    const boom: ModelComplete = async () => {
+      calls += 1;
+      throw new Error("timeout");
+    };
+    const paused = await startEnrichment(loaded, "notes", boom);
+    assert.match(paused, /已暂停/);
+    assert.equal(calls, 2);
+    const job = await loadJob(notes);
+    assert.ok(job);
+    assert.equal(job!.paused, true);
+    assert.equal(job!.chunks.filter((c) => c.status === "failed").length, 2);
+    assert.equal(job!.chunks.filter((c) => c.status === "pending").length, 1);
+    const ok: ModelComplete = async ({ user }) => {
+      calls += 1;
+      const token = user.includes("gamma-token") ? "gamma-token" : user.includes("beta-token") ? "beta-token" : "alpha-token";
+      return {
+        text: JSON.stringify({
+          summary: token,
+          topics: [token],
+          aliases: [],
+          questions: [],
+          rules: [{ text: token, startLine: 1, endLine: 1, excerpt: token }],
+        }),
+        inputTokens: 1,
+        outputTokens: 1,
+      };
+    };
+    const resumed = await startEnrichment(loaded, "notes", ok, { mode: "incremental" });
+    assert.match(resumed, /全量完成/);
+    assert.equal(calls, 5);
+    const done = await loadJob(notes);
+    assert.ok(done);
+    assert.equal(done!.paused, false);
+    assert.ok(done!.chunks.every((c) => c.status === "completed"));
   });
 
   it("enriches a writable vault", async () => {

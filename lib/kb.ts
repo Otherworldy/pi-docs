@@ -121,6 +121,8 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 2048;
 export const DEFAULT_TIMEOUT_MS = 60_000;
 export const DEFAULT_CONCURRENCY = 8;
 export const MAX_CONCURRENCY = 32;
+export const DEFAULT_RETRIES = 2;
+export const MAX_RETRIES = 8;
 
 export type RootInput = {
   name: string;
@@ -171,6 +173,7 @@ export type EnrichSettings = {
   maxOutputTokens: number;
   timeoutMs: number;
   concurrency?: number;
+  retries?: number;
 };
 
 export type ConfigSpec = {
@@ -342,12 +345,17 @@ export function parseEnrichSettings(raw: unknown): EnrichSettings | Fail | undef
   if (concurrency !== undefined && (typeof concurrency !== "number" || !Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32)) {
     return { ok: false, error: "enrich.concurrency 无效" };
   }
+  const retries = rec.retries === undefined ? undefined : rec.retries;
+  if (retries !== undefined && (typeof retries !== "number" || !Number.isInteger(retries) || retries < 0 || retries > MAX_RETRIES)) {
+    return { ok: false, error: "enrich.retries 无效" };
+  }
   return {
     provider: rec.provider.trim(),
     model: rec.model.trim(),
     maxOutputTokens,
     timeoutMs,
     ...(concurrency !== undefined ? { concurrency } : {}),
+    ...(retries !== undefined ? { retries } : {}),
   };
 }
 
@@ -1886,9 +1894,11 @@ async function runKbMenu(
       const enrich = config.ok ? config.enrich : undefined;
       const conc = enrich?.concurrency ?? DEFAULT_CONCURRENCY;
       const timeoutSec = Math.round((enrich?.timeoutMs ?? DEFAULT_TIMEOUT_MS) / 1000);
+      const retries = enrich?.retries ?? DEFAULT_RETRIES;
       const act = await ui.select("设置", [
         { value: "concurrency", label: "并发", description: `${conc} 路，同时整理几篇` },
         { value: "timeout", label: "超时", description: `${timeoutSec} 秒，单次模型请求` },
+        { value: "retries", label: "重试", description: `失败后再打 ${retries} 次，仍失败则跳过` },
       ]);
       if (!act) return;
       const base = await ensureEnrich();
@@ -1912,6 +1922,15 @@ async function runKbMenu(
           continue;
         }
         await saveEnrich({ ...base, timeoutMs: ms });
+      } else if (act === "retries") {
+        const raw = (await ui.input("重试次数", String(retries)))?.trim();
+        if (!raw) continue;
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 0 || n > MAX_RETRIES) {
+          ui.notify(`重试必须是 0–${MAX_RETRIES} 的整数`, "error");
+          continue;
+        }
+        await saveEnrich({ ...base, retries: n });
       }
     }
   }

@@ -14,7 +14,9 @@ import { dirname, join } from "node:path";
 import {
   DEFAULT_CONCURRENCY,
   DEFAULT_MAX_OUTPUT_TOKENS,
+  DEFAULT_RETRIES,
   MAX_CONCURRENCY,
+  MAX_RETRIES,
   RULE_VERSION,
   cacheDirFor,
   formatNote,
@@ -34,6 +36,7 @@ export const PROMPT_VERSION = 1;
 export const CHUNK_VERSION = 1;
 export const JOB_VERSION = 1;
 export const MAX_CHUNK_CHARS = 12_000;
+export const PAUSE_AFTER_THROW_CHUNKS = 2;
 export { DEFAULT_CONCURRENCY, MAX_CONCURRENCY };
 
 export type ModelComplete = (input: {
@@ -99,7 +102,6 @@ export type EnrichJob = {
   model: string;
   promptVersion: number;
   chunkVersion: number;
-  maxRequests: number;
   requests: number;
   inputTokens: number;
   outputTokens: number;
@@ -117,10 +119,6 @@ aliases: 字符串数组，有依据的检索别名
 questions: 字符串数组，相关业务问法
 rules: 数组，每项 {text, startLine, endLine, excerpt}
 excerpt 必须是对应行范围内的原文片段。不要改写数值、否定或“待实现”状态。未知就返回空数组。`;
-
-export function defaultMaxRequests(chunkCount: number): number {
-  return Math.max(1, chunkCount * 2);
-}
 
 export function jobPath(sourcePath: string): string {
   return join(cacheDirFor(sourcePath), "job.json");
@@ -177,7 +175,7 @@ function chunkKey(chunk: Pick<JobChunk, "docPath" | "sourceHash" | "index" | "st
   return `${pathKey(chunk.docPath)}:${chunk.sourceHash}:${chunk.index}:${chunk.startLine}:${chunk.endLine}`;
 }
 
-export function buildJob(snapshot: PreparedSnapshot, enrich: EnrichSettings, maxRequests?: number): EnrichJob {
+export function buildJob(snapshot: PreparedSnapshot, enrich: EnrichSettings): EnrichJob {
   const chunks: JobChunk[] = [];
   for (const doc of snapshot.docs) {
     const parts = splitChunks(doc);
@@ -200,7 +198,6 @@ export function buildJob(snapshot: PreparedSnapshot, enrich: EnrichSettings, max
     model: enrich.model,
     promptVersion: PROMPT_VERSION,
     chunkVersion: CHUNK_VERSION,
-    maxRequests: maxRequests ?? defaultMaxRequests(chunks.length),
     requests: 0,
     inputTokens: 0,
     outputTokens: 0,
@@ -411,7 +408,7 @@ export function jobSummary(job: EnrichJob, current?: string): string {
         ? "部分完成"
         : "进行中";
   const now = current?.trim() ? ` 正在:${current.trim().slice(0, 32)}` : "";
-  return `${job.rootName}: ${state} ${done}/${total} (${pct}%)，失败 ${failed}，请求 ${job.requests}/${job.maxRequests}${now}`;
+  return `${job.rootName}: ${state} ${done}/${total} (${pct}%)，失败 ${failed}，请求 ${job.requests}${now}`;
 }
 
 export async function pauseJob(sourcePath: string): Promise<string> {
@@ -427,6 +424,11 @@ function clampConcurrency(n: number | undefined): number {
   return Math.min(MAX_CONCURRENCY, n);
 }
 
+function clampRetries(n: number | undefined): number {
+  if (!Number.isInteger(n) || n === undefined || n < 0) return DEFAULT_RETRIES;
+  return Math.min(MAX_RETRIES, n);
+}
+
 async function runPool(limit: number, work: () => Promise<boolean>): Promise<void> {
   await Promise.all(Array.from({ length: Math.max(1, limit) }, async () => {
     while (await work()) { /* drain */ }
@@ -437,7 +439,7 @@ export async function startEnrichment(
   config: Extract<LoadedConfig, { ok: true }>,
   rootName: string,
   complete: ModelComplete,
-  opts: { signal?: AbortSignal; maxRequests?: number; onProgress?: (text: string) => void; mode?: "full" | "incremental"; concurrency?: number } = {},
+  opts: { signal?: AbortSignal; onProgress?: (text: string) => void; mode?: "full" | "incremental"; concurrency?: number; retries?: number } = {},
 ): Promise<string> {
   if (!config.enrich) return "未配置清洗模型";
   const root = config.roots.find((r) => r.name === rootName);
@@ -449,7 +451,7 @@ export async function startEnrichment(
   const lock = await acquireLock(sourcePath);
   if (!lock.ok) return lock.error;
   try {
-    const built = buildJob(prepared.snapshot, config.enrich, opts.maxRequests);
+    const built = buildJob(prepared.snapshot, config.enrich);
     let job = opts.mode === "full" ? built : reuseChunks(await loadJob(sourcePath), built);
     job.paused = false;
     const docs = new Map(prepared.snapshot.docs.map((d) => [pathKey(d.path), d]));
@@ -478,18 +480,13 @@ export async function startEnrichment(
           chunk.status = "stale";
           continue;
         }
-        if (job.requests >= job.maxRequests) {
-          job.paused = true;
-          return;
-        }
         chunk.status = "running";
-        job.requests += 1;
         return { chunk, doc };
       }
     };
-    const callModel = (user: string) => complete({
+    const callModel = (prompt: string) => complete({
       system: SYSTEM,
-      user,
+      user: prompt,
       maxTokens: config.enrich!.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
       timeoutMs: config.enrich!.timeoutMs,
       signal,
@@ -497,6 +494,8 @@ export async function startEnrichment(
     await saveJob(sourcePath, job);
     progress();
     const limit = clampConcurrency(opts.concurrency ?? config.enrich.concurrency);
+    const attempts = 1 + clampRetries(opts.retries ?? config.enrich.retries);
+    let throwChunks = 0;
     await runPool(limit, async () => {
       const next = take();
       if (!next) return false;
@@ -504,59 +503,63 @@ export async function startEnrichment(
       progress(doc.title);
       const body = doc.lines.slice(chunk.startLine - 1, chunk.endLine).map((line, i) => `${chunk.startLine + i}|${line}`).join("\n");
       const user = `标题: ${doc.title}\n分类: ${doc.catalog.join(" / ")}\n行 ${chunk.startLine}-${chunk.endLine}:\n${body}`;
-      try {
-        const result = await callModel(user);
+      let lastError: string | undefined;
+      let fromThrow = false;
+      for (let i = 0; i < attempts; i++) {
         if (signal.aborted) {
           chunk.status = "pending";
           chunk.error = undefined;
-          stop();
           return true;
         }
-        job.inputTokens += result.inputTokens;
-        job.outputTokens += result.outputTokens;
-        if (result.costUnknown) job.costUnknown = true;
-        let parsed: ReturnType<typeof validateModelOutput>;
+        job.requests += 1;
+        const prompt = lastError ? `${user}\n上次结果无效：${lastError}。请只返回合法 JSON。` : user;
         try {
-          parsed = validateModelOutput(extractJson(result.text), doc, chunk.startLine, chunk.endLine);
-        } catch {
-          parsed = { ok: false, error: "结果不是 JSON" };
-        }
-        if ("ok" in parsed && job.requests < job.maxRequests && !signal.aborted) {
-          job.requests += 1;
-          const retry = await callModel(`${user}\n上次结果无效：${parsed.error}。请只返回合法 JSON。`);
+          const result = await callModel(prompt);
           if (signal.aborted) {
             chunk.status = "pending";
             chunk.error = undefined;
-            stop();
             return true;
           }
-          job.inputTokens += retry.inputTokens;
-          job.outputTokens += retry.outputTokens;
+          fromThrow = false;
+          job.inputTokens += result.inputTokens;
+          job.outputTokens += result.outputTokens;
+          if (result.costUnknown) job.costUnknown = true;
+          let parsed: ReturnType<typeof validateModelOutput>;
           try {
-            parsed = validateModelOutput(extractJson(retry.text), doc, chunk.startLine, chunk.endLine);
+            parsed = validateModelOutput(extractJson(result.text), doc, chunk.startLine, chunk.endLine);
           } catch {
             parsed = { ok: false, error: "结果不是 JSON" };
           }
-        }
-        if ("ok" in parsed) {
-          chunk.status = "failed";
-          chunk.error = parsed.error;
-          chunk.output = undefined;
-        } else {
-          chunk.status = "completed";
-          chunk.error = undefined;
-          chunk.output = parsed;
-        }
-      } catch (err) {
-        if (signal.aborted) {
-          chunk.status = "pending";
-          chunk.error = undefined;
-        } else {
-          chunk.status = "failed";
-          chunk.error = err instanceof Error ? err.message : "调用失败";
+          if (!("ok" in parsed)) {
+            chunk.status = "completed";
+            chunk.error = undefined;
+            chunk.output = parsed;
+            throwChunks = 0;
+            await persist();
+            const running = job.chunks.filter((c) => c.status === "running").length;
+            progress(running > 1 ? `并行 ${running}` : undefined);
+            return true;
+          }
+          lastError = parsed.error;
+        } catch (err) {
+          if (signal.aborted) {
+            chunk.status = "pending";
+            chunk.error = undefined;
+            return true;
+          }
+          fromThrow = true;
+          lastError = err instanceof Error ? err.message : "调用失败";
           job.costUnknown = true;
         }
-        stop();
+      }
+      chunk.status = "failed";
+      chunk.error = lastError;
+      chunk.output = undefined;
+      if (fromThrow) {
+        throwChunks += 1;
+        if (throwChunks >= PAUSE_AFTER_THROW_CHUNKS) stop();
+      } else {
+        throwChunks = 0;
       }
       await persist();
       const running = job.chunks.filter((c) => c.status === "running").length;
